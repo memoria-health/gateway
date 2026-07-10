@@ -42,16 +42,12 @@ json.dump(d, open(p, "w"), indent=2)
 PY
 fi
 
-# 3. unique reverse-SSH tunnel port so boxes don't collide on the relay VPS
-#    (the baked unit hardcodes 22001). Derived from the NEW machine-id, range
-#    22001-22999, recorded to .tunnel-port so the relay operator can map it.
-TUNIT=/etc/systemd/system/memoria-tunnel.service
-if [ -f "$TUNIT" ]; then
-  PORT=$(( 22001 + ( 0x$(cut -c1-4 /etc/machine-id) % 999 ) ))
-  sed -i -E "s/-R [0-9]+:localhost:22/-R ${PORT}:localhost:22/" "$TUNIT"
-  echo "$PORT" > "$INSTALL_DIR/.tunnel-port"
-  echo "assigned reverse-tunnel port $PORT"
-fi
+# 3. reverse-SSH tunnel port is assigned by the BACKEND (unique per box, in the
+#    gateways table), delivered in the roster and written to .tunnel-port by
+#    publisher.py AFTER this box is provisioned. So firstboot just clears any
+#    stale port — the tunnel (deploy/tunnel.sh) idles until the backend assigns
+#    one, then reconnects on the new port automatically (no hashing, no collisions).
+rm -f "$INSTALL_DIR/.tunnel-port"
 
 # 4. drop the template's accumulated logs
 journalctl --rotate >/dev/null 2>&1 || true

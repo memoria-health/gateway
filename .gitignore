@@ -7,5 +7,10 @@ __pycache__/
 clips/
 viewer/config.js
 
-# per-box runtime config (written by the setup portal)
+# per-box runtime config + identity (NEVER tracked — this is what lets every box
+# run identical code from git while keeping its own identity)
 cameras.json
+cameras.*.json.bak
+.tunnel-port
+.provisioned
+/wifi-connect/

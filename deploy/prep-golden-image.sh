@@ -29,6 +29,15 @@ cp "$SCRIPT_DIR/memoria-firstboot.service" /etc/systemd/system/memoria-firstboot
 systemctl daemon-reload
 systemctl enable memoria-firstboot.service
 
+say "Installing the dynamic reverse-tunnel unit (port assigned by the backend)"
+# Replaces any hardcoded-port tunnel unit: the port now comes from .tunnel-port
+# (publisher.py writes it from the roster), so every box gets a UNIQUE off-LAN
+# port with no collisions. tunnel.sh ships in the repo at deploy/tunnel.sh.
+chmod +x "$INSTALL_DIR/deploy/tunnel.sh" 2>/dev/null || true
+cp "$SCRIPT_DIR/memoria-tunnel.service" /etc/systemd/system/memoria-tunnel.service
+systemctl daemon-reload
+systemctl enable memoria-tunnel.service
+
 say "Deleting saved Wi-Fi so a clone raises the onboarding hotspot"
 # Every wireless NM connection (e.g. 'Suburban Living', 'jesstan') — gone, so a
 # clone boots offline and memoria-wifi-portal broadcasts Memoria-Setup-XXXX.

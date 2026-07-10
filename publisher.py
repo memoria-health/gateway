@@ -454,7 +454,28 @@ class RosterManager:
         req = urllib.request.Request(
             self.roster_url, headers={"Authorization": f"Bearer {self.token}"})
         with urllib.request.urlopen(req, timeout=8) as r:
-            return json.loads(r.read().decode()).get("cameras", [])
+            data = json.loads(r.read().decode())
+        self._apply_tunnel_port(data.get("tunnel_port"))
+        return data.get("cameras", [])
+
+    def _apply_tunnel_port(self, port):
+        """Persist the DB-assigned reverse-SSH port to .tunnel-port when it
+        changes. `deploy/tunnel.sh` watches that file and (re)connects autossh on
+        the new port — so a freshly-provisioned box gets its own unique off-LAN
+        port with NO root and NO restart. Best-effort: must never disturb the
+        publisher (the backend may be old and omit the field, hence the guard)."""
+        if not port:
+            return
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            pf = os.path.join(here, ".tunnel-port")
+            cur = open(pf).read().strip() if os.path.exists(pf) else None
+            if cur != str(port):
+                with open(pf, "w") as f:
+                    f.write(str(port))
+                log(f"tunnel port assigned by backend: {port} (was {cur or 'unset'})")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _fetch_wait(self, since):
         url = f"{self.wait_url}?since={urllib.parse.quote(since)}"
