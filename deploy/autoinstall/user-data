@@ -1,0 +1,56 @@
+#cloud-config
+# Ubuntu Server unattended autoinstall for the Memoria gateway.
+#
+# Boots the Ubuntu installer, wipes the disk, installs a base system with NO
+# questions, then on FIRST BOOT runs deploy/setup.sh (which turns it into a full
+# gateway: services + camera portal + Wi-Fi portal).
+#
+# ── REQUIREMENTS ────────────────────────────────────────────────────────────
+#  * Plug the box into ETHERNET for this build. The installer + setup.sh need
+#    internet (apt/pip/wifi-connect). Field units never do this — they use the
+#    Wi-Fi portal. This is a BENCH build (to make a master / a ready unit).
+#  * Set REPO_URL below to where this repo is reachable (git), OR bake the code
+#    onto the USB and adjust the clone step.
+#  * Replace the password hash:  openssl passwd -6 'yourpassword'
+#
+# ── USAGE ───────────────────────────────────────────────────────────────────
+#  Put this file + an empty `meta-data` on a FAT32 USB labeled CIDATA, boot the
+#  Ubuntu Server installer USB with it inserted, and the install runs hands-off.
+autoinstall:
+  version: 1
+  locale: en_US.UTF-8
+  keyboard: {layout: us}
+  ssh:
+    install-server: true
+    allow-pw: true
+  identity:
+    hostname: memoria-gateway
+    realname: Memoria Gateway
+    username: memoria
+    # >>> REPLACE: openssl passwd -6 'yourpassword'
+    password: "$6$REPLACE_ME_WITH_A_REAL_HASH"
+  storage:
+    layout: {name: direct}     # whole-disk, no LVM/LUKS — simplest to image
+  packages: [git, curl]
+  late-commands:
+    # 1. fetch the gateway code into the installed system
+    - >-
+      curtin in-target --target=/target -- bash -c
+      "git clone REPO_URL /opt/memoria-gateway-src || true"
+    # 2. install a one-shot 'provision' service that runs setup.sh on first boot
+    #    (real systemd + network — cleaner than running it inside the chroot)
+    - >-
+      curtin in-target --target=/target -- bash -c
+      "cat > /etc/systemd/system/memoria-provision.service <<'U'
+      [Unit]
+      Description=Run Memoria setup.sh once on first boot
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=/opt/memoria-gateway-src/deploy/setup.sh
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/bash -lc 'cd /opt/memoria-gateway-src && ENABLE_WIFI_PORTAL=1 bash deploy/setup.sh; systemctl disable memoria-provision.service'
+      [Install]
+      WantedBy=multi-user.target
+      U"
+    - curtin in-target --target=/target -- systemctl enable memoria-provision.service

@@ -1,0 +1,12 @@
+{
+  "_comment": "SHAPE ONLY. The real cameras.json is per-box, written by the setup portal, and gitignored.",
+  "livekit_url": "wss://<project>.livekit.cloud",
+  "livekit_api_key": "<LIVEKIT_API_KEY>",
+  "livekit_api_secret": "<LIVEKIT_API_SECRET>",
+  "backend_url": "https://<backend-host>",
+  "poll_seconds": 1,
+  "gateway_token": "<UNIQUE_PER_BOX_TOKEN>",
+  "cameras": [
+    { "livekit_identity": "cam_xxxxxxxx", "rtsp": "rtsp://user:pass@10.0.0.x:554/stream1", "mac": null }
+  ]
+}

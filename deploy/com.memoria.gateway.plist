@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Mac sim service: makes the gateway start on login and stay up (KeepAlive).
+     Install:  cp deploy/com.memoria.gateway.plist ~/Library/LaunchAgents/
+               launchctl load ~/Library/LaunchAgents/com.memoria.gateway.plist
+     This is the macOS equivalent of the systemd unit used on the real mini-PC. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memoria.gateway</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/sunnycui/Documents/code/1.8-nemara-demo-ready/nemara-gateway/run.sh</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/gw-publisher.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/gw-publisher.log</string>
+</dict>
+</plist>
