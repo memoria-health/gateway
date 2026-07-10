@@ -290,3 +290,42 @@ English → "Don't touch keymap" → Start_Clonezilla → `device-image` → `lo
 (not the USB) → compression **z9p** → check-image **Yes** → `-p choose` → confirm.
 `restoredisk` is the same until the action step. mDNS: two boxes both answer to
 `memoria-gateway.local` — keep them on different networks during setup.
+
+## 13. Fleet SSH registry (which box is which — rock solid)
+
+With many boxes all reverse-tunneling through the ONE relay, you must never guess
+which port is which home. The **backend `gateways` table is the source of truth**:
+
+- Column **`gateways.tunnel_port`** — a UNIQUE port the DB assigns (sequence
+  `gateway_tunnel_port_seq`; migration `nemara-backend/scripts/apply_tunnel_registry_delta.sql`,
+  applied to prod 2026-07-09). OptiPlex = `22001`; each new box auto-gets `22002…`.
+  Never hashed/guessed → no collisions.
+- **`GET /v1/gateway/roster`** returns `tunnel_port`. On the box, `publisher.py`
+  writes it to `/opt/memoria-gateway/.tunnel-port`; `deploy/tunnel.sh` (the tunnel
+  unit's ExecStart) reads that file and (re)connects autossh on it — so a box gets
+  its port automatically after it's provisioned, no root, no restart.
+- **Reach any box by name:** on the fleet Mac, `python3 scripts/gen-ssh-config.py`
+  (needs `SUPABASE_MGMT_TOKEN`) reads the registry (port + caregiver email) and
+  writes `~/.ssh/config.d/memoria-fleet` — one `Host memoria-<caregiver-email>`
+  per box. Then `ssh memoria-jane-patel-co` (verified working off-network). Re-run
+  it whenever you add/remove a box.
+- **Who's online now:** on the relay, `ss -tlnp | grep 220` = ports currently
+  bound = boxes with a live tunnel; cross-ref `last_seen_at` in `gateways`.
+
+## 14. Code deployment — git, not rsync (no drift)
+
+The box's `/opt/memoria-gateway` should be a **git checkout** of
+`github.com/potaton00b/nemara-gateway`, so every box runs identical, versioned
+code while keeping its own gitignored identity (`cameras.json`, `.provisioned`,
+`.tunnel-port`, `wifi-connect/`).
+
+- Convert a box: `deploy/git-bootstrap.sh` (uses the read-only **deploy key** at
+  `~/.ssh/memoria_deploy`, added to the repo's GitHub deploy keys). `prep-golden-image.sh`
+  builds this into the template, so fresh boxes are git-connected from birth.
+- Deploy new code: `cd /opt/memoria-gateway && git pull && sudo systemctl restart memoria-gateway`.
+  `git rev-parse HEAD` tells you exactly what a box runs.
+- **The live OptiPlex is still an rsync'd folder (NOT git) — intentionally left
+  alone.** Convert it deliberately with `git-bootstrap.sh` when you choose; until
+  then keep using rsync (§5) for it only.
+- Backend: the roster change is committed; **deploy it (`railway up`) before
+  provisioning box #2** so prod actually returns `tunnel_port`.
