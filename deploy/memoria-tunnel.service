@@ -1,0 +1,14 @@
+[Unit]
+Description=Memoria reverse-SSH tunnel to relay VPS (dynamic port from .tunnel-port)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=potaton00b
+Environment=AUTOSSH_GATETIME=0
+ExecStart=/opt/memoria-gateway/deploy/tunnel.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
