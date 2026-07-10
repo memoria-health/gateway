@@ -40,6 +40,17 @@ d["cameras"] = []
 d["gateway_token"] = "gw-" + secrets.token_urlsafe(24)
 json.dump(d, open(p, "w"), indent=2)
 PY
+  # 2b. keep the SETUP PORTAL's token in sync with the freshly-minted one. The
+  #     :8088 portal (memoria-setup) has GATEWAY_TOKEN baked into its unit from
+  #     the SOURCE image. If we don't update it, the portal provisions under the
+  #     source box's token -> cameras land on the WRONG gateway, and this box's
+  #     own token stays unregistered (publisher 401). Sync it to cameras.json.
+  NEWTOK=$(python3 -c "import json;print(json.load(open('$CJ'))['gateway_token'])" 2>/dev/null || true)
+  SU=/etc/systemd/system/memoria-setup.service
+  if [ -n "$NEWTOK" ] && [ -f "$SU" ]; then
+    sed -i -E "s|GATEWAY_TOKEN=[^[:space:]\"]+|GATEWAY_TOKEN=${NEWTOK}|g" "$SU"
+    systemctl daemon-reload
+  fi
 fi
 
 # 3. reverse-SSH tunnel port is assigned by the BACKEND (unique per box, in the
