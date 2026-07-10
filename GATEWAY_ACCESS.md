@@ -328,4 +328,31 @@ code while keeping its own gitignored identity (`cameras.json`, `.provisioned`,
   alone.** Convert it deliberately with `git-bootstrap.sh` when you choose; until
   then keep using rsync (§5) for it only.
 - Backend: the roster change is committed; **deploy it (`railway up`) before
-  provisioning box #2** so prod actually returns `tunnel_port`.
+  provisioning box #2** so prod actually returns `tunnel_port`. (Deployed 2026-07-10.)
+
+## 15. Team access — the `gw` command + multi-person auth
+
+`scripts/gw <caregiver-email> [cmd]` — SSH into any box **by account**, from anywhere:
+```bash
+gw jane@patel.co
+gw jane@patel.co "journalctl -u memoria-gateway -n 50"
+```
+It resolves the account's `tunnel_port` from the registry and connects through the
+relay — no per-box config, no remembering ports. Needs `SUPABASE_MGMT_TOKEN` + the
+`memoria-relay` hop in `~/.ssh/config`. Put it on PATH: `ln -s "$PWD/scripts/gw" /usr/local/bin/gw`.
+Verified 2026-07-10 (`gw jane@patel.co` → port 22001 → box).
+
+**The relay is the single access-control choke point** — everyone reaches every box
+*through* it, so grant/revoke access there, in one place:
+- **Person → relay:** each teammate's OWN public key in the relay's authorized_keys.
+  Their own key = revocable per person; remove it → they lose the **entire** fleet
+  at once (they can't hop, so they can't reach any box).
+- **relay → box:** boxes trust ONE shared **fleet key** (baked into the template).
+  Access is already gated at the relay, so box keys don't need to be per-person.
+- **Add a teammate (e.g. cofounder):** they generate an SSH key → add their public
+  key to the relay → give them the registry token + the `gw` script. Done — `gw
+  <account>` works for them too, from their own machine.
+- **Today** the box hop still uses the password (`qwerty123`). Installing the fleet
+  key on boxes (automatic in the template; a one-time append on the OptiPlex) makes
+  `gw` fully passwordless. The OptiPlex is intentionally left on password until you
+  choose to upgrade it.

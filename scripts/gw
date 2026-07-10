@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# gw — SSH into a gateway box BY CAREGIVER ACCOUNT, from anywhere.
+#
+#   gw jane@patel.co                 # interactive shell on that box
+#   gw jane@patel.co "journalctl -u memoria-gateway -n 50"   # run one command
+#
+# It resolves the account's unique reverse-SSH port from the backend registry
+# (gateways.tunnel_port), then connects THROUGH the relay. No per-box SSH config,
+# no remembering ports — add a box, it self-registers, and `gw <account>` works.
+#
+# Needs: SUPABASE_MGMT_TOKEN in the env, and the `memoria-relay` hop in
+# ~/.ssh/config (both are on the fleet Mac). Box auth is whatever ssh negotiates —
+# the fleet key if installed (passwordless), else it prompts for the box password.
+set -euo pipefail
+ACCT="${1:-}"
+[ -n "$ACCT" ] || { echo "usage: gw <caregiver-email> [command...]" >&2; exit 1; }
+shift || true
+case "$ACCT" in *\'*|*\"*|*\;*) echo "invalid account" >&2; exit 1;; esac  # keep the SQL clean
+: "${SUPABASE_MGMT_TOKEN:?set SUPABASE_MGMT_TOKEN (the sbp_… management token)}"
+PROJECT="${SUPABASE_PROJECT:-zgifmvjnggmgzvtnosnu}"   # prod
+
+PORT=$(curl -s -X POST "https://api.supabase.com/v1/projects/$PROJECT/database/query" \
+  -H "Authorization: Bearer $SUPABASE_MGMT_TOKEN" \
+  -H "Content-Type: application/json" -H "User-Agent: Mozilla/5.0" \
+  -d "{\"query\":\"SELECT g.tunnel_port FROM public.gateways g JOIN public.caregivers c ON c.id=g.caregiver_id WHERE lower(c.email)=lower('${ACCT}') AND g.tunnel_port IS NOT NULL ORDER BY g.tunnel_port LIMIT 1\"}" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['tunnel_port'] if isinstance(d,list) and d else '')")
+
+[ -n "$PORT" ] || { echo "gw: no gateway found for '$ACCT'" >&2; exit 1; }
+echo "gw: $ACCT -> reverse port $PORT (through memoria-relay)" >&2
+exec ssh -J memoria-relay -p "$PORT" \
+  -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+  potaton00b@localhost "$@"
