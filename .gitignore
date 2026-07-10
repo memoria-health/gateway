@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+clips/
+viewer/config.js
+
+# per-box runtime config (written by the setup portal)
+cameras.json

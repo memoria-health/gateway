@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>nemara-gateway — local viewer</title>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+<style>
+  body { margin: 0; background: #0d0d0f; color: #e8e8ea; font-family: -apple-system, system-ui, sans-serif; }
+  #bar { padding: 10px 14px; font-size: 14px; display: flex; gap: 12px; align-items: center; border-bottom: 1px solid #222; }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: #888; }
+  #grid { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px; }
+  video { width: 100%; max-width: 960px; background: #000; border-radius: 8px; }
+  .muted { color: #9a9aa2; }
+</style>
+</head>
+<body>
+  <div id="bar"><span id="dot"></span><strong>nemara-gateway viewer</strong><span id="status" class="muted">connecting…</span></div>
+  <div id="grid"></div>
+  <script src="config.js"></script>
+  <script>
+    const LK = window.LivekitClient || window.LiveKitClient;
+    const statusEl = document.getElementById('status');
+    const dot = document.getElementById('dot');
+    const grid = document.getElementById('grid');
+    const set = (t, color) => { statusEl.textContent = t; if (color) dot.style.background = color; };
+
+    async function main() {
+      if (!LK) return set('failed to load LiveKit client from CDN (are you online?)', '#e5484d');
+      if (!window.LK_CONFIG) return set('config.js missing', '#e5484d');
+      const room = new LK.Room({ adaptiveStream: true });
+
+      room.on(LK.RoomEvent.TrackSubscribed, (track, pub, participant) => {
+        if (track.kind === LK.Track.Kind.Video) {
+          const el = track.attach();
+          el.autoplay = true; el.playsInline = true; el.muted = true;
+          el.id = 'v_' + participant.identity;
+          if (!document.getElementById(el.id)) grid.appendChild(el);
+          set('LIVE — ' + participant.identity, '#46c267');
+        }
+      });
+      room.on(LK.RoomEvent.ParticipantConnected, p => set('participant joined: ' + p.identity, '#e2b73d'));
+      room.on(LK.RoomEvent.Disconnected, () => set('disconnected', '#e5484d'));
+
+      set('connecting to ' + window.LK_CONFIG.url + ' …', '#e2b73d');
+      await room.connect(window.LK_CONFIG.url, window.LK_CONFIG.token);
+      set('connected to room "' + window.LK_CONFIG.room + '" — waiting for video…', '#e2b73d');
+    }
+    main().catch(e => set('error: ' + (e && e.message ? e.message : e), '#e5484d'));
+  </script>
+</body>
+</html>
