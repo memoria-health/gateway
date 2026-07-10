@@ -1,0 +1,14 @@
+[Unit]
+Description=Memoria first-boot uniqueness (runs once per fresh clone)
+# Must run BEFORE the gateway reads cameras.json and BEFORE the tunnel opens its
+# (now per-box) reverse port.
+Before=memoria-gateway.service memoria-tunnel.service
+# Guard #1: never run on a box that's already been provisioned.
+ConditionPathExists=!/opt/memoria-gateway/.provisioned
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/memoria-firstboot.sh
+
+[Install]
+WantedBy=multi-user.target

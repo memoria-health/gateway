@@ -87,11 +87,13 @@ Tip: scrub the password out of any output you print (`sed 's/<GATEWAY_PASSWORD-R
   - `cameras.json` — the config (see §6).
   - `cameras.dev.json.bak` — backup of the DEV config (restore to point at dev).
 
-- **systemd service:** `memoria-gateway` (enabled, `Restart=always`).
-  - `WorkingDirectory=/opt/memoria-gateway`
-  - `ExecStart=/opt/memoria-gateway/.venv/bin/python publisher.py`
-- **Setup portal service:** `memoria-setup` (installed, NOT enabled on boot;
-  `sudo systemctl start memoria-setup`).
+- **systemd services (all ENABLED on the OptiPlex — verified 2026-07-09):**
+  - `memoria-gateway` — the publisher (`Restart=always`, `ExecStart=…/.venv/bin/python publisher.py`).
+  - `memoria-setup` — camera setup portal on `:8088` (enabled on boot; §7).
+  - `memoria-tunnel` — off-LAN reverse-SSH relay: `autossh -M 0 -N -R 22001:localhost:22 tunnel@144.126.211.110`, key `~/.ssh/memoria_tunnel_key`. **Port 22001 is hardcoded → clones collide** (firstboot reassigns it per-box; see §12).
+  - `memoria-wifi-portal` — captive-portal hotspot when offline. `wifi-portal.sh`: `sleep 8 → nm-online -t 20 → if offline, wifi-connect --portal-ssid Memoria-Setup-<mac-suffix>`. Self-gating: silent when Wi-Fi is already up.
+  - **`memoria-firstboot` — NOT installed on the OptiPlex** (it was hand-built; `setup.sh`'s firstboot step never ran here). It only exists in a *template* image, installed by `prep-golden-image.sh` (§12). This is why a plain clone of this box is a twin, not a blank unit.
+- **Wi-Fi is NetworkManager-managed.** Saved connections: `Suburban Living` (active) + `jesstan`. Renderer set via `/etc/netplan/01-network-manager-all.yaml`; connections exported to `/etc/netplan/90-NM-*.yaml`. `systemd-networkd` is also active but only owns the (unused) ethernet.
 
 ## 5. Deploy / edit workflow
 
@@ -196,4 +198,59 @@ nmcli -t -f NAME,DEVICE,STATE con show --active        # Wi-Fi connected?
   detector bot from already-live LiveKit rooms until the camera reconnects; if a
   patient's analyses go silent after a backend deploy, bounce that camera
   (Disconnect→Reconnect in the app, or toggle `cameras.desired_state`).
-- Golden image is stale — re-capture from this box if cloning.
+- **Cloning a new box?** A plain clone of this OptiPlex is a *twin* (same token,
+  same machine-id, same tunnel port, same Wi-Fi) — it will fight the OptiPlex.
+  To make a proper self-onboarding **template**, see §12.
+
+## 12. Golden image & fleet templates (cloning new boxes)
+
+**Tooling:** Clonezilla, restored/saved to a USB. On a Dell OptiPlex the one-time
+boot-menu key is **F12**; a Lenovo ThinkCentre is also **F12** (BIOS = F1).
+
+**Two kinds of image — do not confuse them:**
+- **Plain clone (IMAGE-A):** a `savedisk` of a live box as-is. It carries that
+  box's identity (token, machine-id, SSH keys, tunnel port, saved Wi-Fi) and has
+  **no** `memoria-firstboot`. Flashing it makes a **twin**. Useful only as a
+  backup/restore of that *same* box.
+- **Template (IMAGE-B):** a box that was **generalized** with
+  `deploy/prep-golden-image.sh` before capture. Every clone self-onboards.
+
+**The per-box things that MUST differ between units** (all handled by firstboot):
+machine-id, SSH host keys, `gateway_token` (in `cameras.json`), the reverse-SSH
+**tunnel port** (baked unit hardcodes 22001), and the saved **Wi-Fi** (deleted so
+the hotspot raises). Firmware **AC-recovery does NOT travel in any image** — set
+it per box (Dell: sysfs, §10; Lenovo: BIOS → Power → After Power Loss → On).
+
+**Build a template — never on the live OptiPlex (prep wipes its identity + Wi-Fi).
+Use a disposable workbench box (e.g. the Lenovo), at its console (no ethernet
+anywhere; Wi-Fi only):**
+1. Flash the workbench box from any working image (IMAGE-A) — gives it a working
+   OS + code base.
+2. Bring it online at the console over Wi-Fi: `ip link` → find the Wi-Fi iface →
+   `nmcli device wifi connect "Suburban Living" password "<WIFI_PASSWORD-REDACTED>"` →
+   `git pull` the repo (this is why the code lives on GitHub: so the box can pull it).
+3. `sudo bash deploy/prep-golden-image.sh` — installs `memoria-firstboot`, deletes
+   saved Wi-Fi, blanks identity, arms the run-once flag.
+4. `sudo poweroff` (**do NOT reboot** — a reboot runs firstboot and un-arms it).
+5. Boot the **Clonezilla USB** → `savedisk` → that image is IMAGE-B, the template.
+
+**Flash a field box from IMAGE-B:** boot Clonezilla → `restoredisk` → target =
+its internal SSD (⚠ erases it) → poweroff → remove USB → power on. **First boot
+only:** `Memoria-Setup-XXXX` hotspot appears → join from a phone, enter the site
+Wi-Fi password → box comes online → firstboot mints a unique token + machine-id +
+SSH keys + tunnel port, then disables itself. **Every boot after:** straight to
+running. Then add cameras via the phone portal at `http://<box>.local:8088`.
+
+**"Exactly once" guarantee (two independent guards):** the firstboot unit has
+`ConditionPathExists=!/opt/memoria-gateway/.provisioned`, and the script both
+`touch`es that flag and `systemctl disable`s itself on success. `prep-golden-image.sh`
+is the only thing that removes the flag (i.e. re-arms). An already-set-up box (or
+the OptiPlex, which has no firstboot at all) never re-provisions.
+
+**Clonezilla `savedisk` quick path:** boot USB → *Clonezilla live (default)* →
+English → "Don't touch keymap" → Start_Clonezilla → `device-image` → `local_dev`
+→ (Ctrl+C after detection) → pick the USB **data** partition → `exit_directory_browsing`
+→ `<Done>` → `Beginner` → `savedisk` → name it → source = the **internal SSD**
+(not the USB) → compression **z9p** → check-image **Yes** → `-p choose` → confirm.
+`restoredisk` is the same until the action step. mDNS: two boxes both answer to
+`memoria-gateway.local` — keep them on different networks during setup.
