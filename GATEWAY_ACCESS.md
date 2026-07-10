@@ -72,6 +72,42 @@ expect {
 ```
 Tip: scrub the password out of any output you print (`sed 's/<GATEWAY_PASSWORD-REDACTED>/***/g'`).
 
+### Off-LAN access (when NOT on the box's Wi-Fi) — via the DO relay
+
+`memoria-gateway.local` (mDNS) only resolves on the **same LAN**. From anywhere
+else, reach the box through the reverse-SSH relay — DigitalOcean droplet
+**`memoria-relay`**, **`144.126.211.110`** (sfo3, `status=active`). This Mac's
+`~/.ssh/config` already has the hops wired:
+
+```bash
+ssh memoria-box-01   # → ProxyJump memoria-relay → localhost:22001 → OptiPlex (password <GATEWAY_PASSWORD-REDACTED>)
+```
+Verified working off-network 2026-07-09.
+
+- **Relay login:** `root@144.126.211.110`, key **`~/.ssh/memoria_vps`** (= the DO
+  account key `memoria-admin`, fp `d3:e8:c3:60:…:54:84`; installed as root at
+  droplet creation). The DO API token is in memory (`reference_digitalocean_token`).
+- **`GatewayPorts no`** on the relay → `22001` binds to the relay's **localhost
+  only**, so you CANNOT hit `144.126.211.110:22001` directly (it times out) — you
+  MUST hop through (ProxyJump). That timeout is expected, not an outage.
+- **Tunnel health check** (run on the relay): `ss -tlnp | grep 22001` → a `LISTEN
+  127.0.0.1:22001` line means the box's `memoria-tunnel` (autossh) is connected.
+- **Fresh Mac (no config)?** Copy the `memoria_vps` private key, then add:
+  ```
+  Host memoria-relay
+      HostName 144.126.211.110
+      User root
+      IdentityFile ~/.ssh/memoria_vps
+  Host memoria-box-01
+      HostName localhost
+      Port 22001
+      User potaton00b
+      ProxyJump memoria-relay
+  ```
+- **Per-box ports:** each unit uses a UNIQUE reverse port (firstboot assigns it;
+  the OptiPlex = `22001`, recorded in `/opt/memoria-gateway/.tunnel-port`). Add a
+  `Host memoria-box-NN` block per box with its own port.
+
 ## 4. Where the software lives
 
 - **Dir:** `/opt/memoria-gateway/`
