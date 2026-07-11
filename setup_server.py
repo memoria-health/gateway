@@ -18,6 +18,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import subprocess
 import urllib.error
 import urllib.request
@@ -330,23 +331,67 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": str(e)})
 
 
+_CERT = os.path.join(HERE, "portal-cert.pem")
+_KEY = os.path.join(HERE, "portal-key.pem")
+
+
+def _ensure_cert():
+    """Self-signed cert so the portal ALSO answers HTTPS. Browsers (esp. Safari)
+    auto-upgrade http->https; with no TLS listener that just HANGS. With one, the
+    box answers and the installer taps through a one-time warning (you can't get a
+    trusted cert for a `.local` name). Generated once on the box via openssl."""
+    if os.path.exists(_CERT) and os.path.exists(_KEY):
+        return
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", _KEY, "-out", _CERT, "-days", "3650",
+         "-subj", "/CN=memoria-gateway.local",
+         "-addext", "subjectAltName=DNS:memoria-gateway.local,DNS:*.local,IP:127.0.0.1"],
+        check=True, capture_output=True)
+
+
 class DualStackServer(ThreadingHTTPServer):
     """Listen on IPv6 AND IPv4 (dual-stack). avahi/Bonjour advertises the box's
     AAAA (IPv6) records on any IPv6-enabled home network, so browsers resolve
     `memoria-gateway.local` to an IPv6 address and connect over IPv6. An IPv4-only
     bind (0.0.0.0) REFUSES those (`ERR_CONNECTION_REFUSED`) even though the name
     resolves fine — the exact failure seen in the field. Binding `::` with
-    IPV6_V6ONLY off accepts whichever protocol the client (phone) picks."""
+    IPV6_V6ONLY off accepts whichever protocol the client (phone) picks.
+
+    Also serves HTTP *and* HTTPS on the SAME port: we peek the first byte of each
+    connection (0x16 == TLS handshake) and wrap it in TLS if so. So
+    `memoria-gateway.local:8088` works whether the browser sends http or (silently
+    upgraded) https — no more 'stuck loading' on Safari."""
     address_family = socket.AF_INET6
+    ssl_ctx = None
 
     def server_bind(self):
         self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         super().server_bind()
 
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        try:
+            if self.ssl_ctx and sock.recv(1, socket.MSG_PEEK) == b"\x16":
+                sock = self.ssl_ctx.wrap_socket(sock, server_side=True)
+        except OSError:
+            try:
+                sock.close()
+            finally:
+                raise
+        return sock, addr
+
 
 def main():
     port = int(os.environ.get("SETUP_PORT", "8088"))
-    print(f"gateway setup agent -> http://memoria-gateway.local:{port}", flush=True)
+    try:
+        _ensure_cert()
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(_CERT, _KEY)
+        DualStackServer.ssl_ctx = ctx
+    except Exception as e:  # noqa: BLE001 — TLS must never block the portal
+        print(f"[setup] TLS unavailable ({e}); serving HTTP only", flush=True)
+    print(f"gateway setup agent -> http(s)://memoria-gateway.local:{port}", flush=True)
     DualStackServer(("::", port), Handler).serve_forever()
 
 

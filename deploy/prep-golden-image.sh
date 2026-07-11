@@ -48,7 +48,7 @@ rm -f /etc/netplan/90-NM-*.yaml   # the netplan exports of those NM connections
 # Keep 01-network-manager-all.yaml (renderer=NetworkManager) — wifi-connect needs it.
 
 say "Arming firstboot: clearing the run-once flag + baked identity"
-rm -f "$INSTALL_DIR/.provisioned" "$INSTALL_DIR/.tunnel-port"
+rm -f "$INSTALL_DIR/.provisioned" "$INSTALL_DIR/.tunnel-port" "$INSTALL_DIR/portal-cert.pem" "$INSTALL_DIR/portal-key.pem"
 # machine-id + SSH host keys: blank now (systemd/ssh also regenerate on boot;
 # firstboot regenerates too — belt and suspenders so the image carries neither).
 truncate -s 0 /etc/machine-id || true
