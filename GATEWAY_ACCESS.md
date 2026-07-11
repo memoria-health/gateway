@@ -175,14 +175,26 @@ then `stream 1920x1080@15 — pipeline up`.
 
 ## 7. Setup portal (onboarding a new box / adding cameras)
 
-- Start it: `sudo systemctl start memoria-setup` → serves
-  `http://memoria-gateway.local:8088` (dual-stack IPv6+IPv4 — required, IPv6-only
-  homes broke IPv4-only binds).
-- Phone flow: scan subnet for Tapos → sign in by **email only** (no password) →
-  name → Provision → registers the camera in the backend roster + appends
-  `{livekit_identity, rtsp, mac}` to `cameras.json`; the publisher picks it up on
-  the next poll (no restart). New Tapo prep: join it to the Wi-Fi via the Tapo
-  app first (C100 is 2.4 GHz only), set its Camera Account (RTSP creds).
+- **Enabled on boot** → serves `memoria-gateway.local:8088`. **Dual-stack
+  IPv6+IPv4** (IPv6-only homes broke IPv4-only binds) **AND now serves HTTP *and*
+  HTTPS on the same port** (it peeks the first byte for the TLS handshake and
+  wraps if so). This fixes the "stuck loading" seen when a browser (esp. Safari)
+  auto-upgrades `memoria-gateway.local:8088` to https — the box now answers with a
+  **self-signed cert** (generated per-box on first start; you can't get a trusted
+  cert for a `.local` name, so it's a one-time "proceed anyway" warning). Plain
+  `http://memoria-gateway.local:8088` skips the warning entirely.
+- Phone flow: **Scan** subnet for Tapos (`discover.py` sweeps :554, credential-
+  free) → sign in by **email only** (no password) → name → **Provision**.
+  Provisioning uses **this box's own `gateway_token`** (firstboot syncs the token
+  into the memoria-setup unit — §12), so it creates/updates *this* box's gateways
+  row, then appends `{livekit_identity, rtsp, mac}` to `cameras.json`; the
+  publisher picks it up next poll (no restart).
+- **Camera creds:** the portal probes/pulls RTSP with **`camera1` / `<GATEWAY_PASSWORD-REDACTED>`**
+  by default. A camera shows in the scan regardless (discovery is credential-free)
+  but the **thumbnail** needs matching creds — if a Tapo's Camera Account differs,
+  edit the per-camera `user`/`pass` fields + hit **↻**, or set the Tapo's Camera
+  Account to `camera1`/`<GATEWAY_PASSWORD-REDACTED>`. New Tapo prep: join it to Wi-Fi via the Tapo
+  app first (C100 is 2.4 GHz only), then set its Camera Account.
 
 ## 8. How it works (architecture, brief)
 
@@ -240,8 +252,30 @@ nmcli -t -f NAME,DEVICE,STATE con show --active        # Wi-Fi connected?
 
 ## 12. Golden image & fleet templates (cloning new boxes)
 
+**STATUS (built + validated 2026-07-11):** the working template is
+**`memoria-template-final`** on the golden-image USB. Flash it → box self-onboards
+(hotspot → Wi-Fi), mints a unique identity, portal answers http+https, and
+provisioning registers the box's *own* gateway. Two bugs found + fixed while
+building it: (1) firstboot now **syncs the minted `gateway_token` into the
+memoria-setup unit** (else the portal provisioned under the source box's token →
+cameras on the wrong gateway + 401); (2) the portal now **serves HTTPS** (§7).
+The golden-image stick also holds `2026-07-10-03-img-Jul-9-2026` = an IMAGE-A
+(OptiPlex) backup. Field boxes need an **AP-capable Wi-Fi adapter** (MediaTek
+MT7921 USB e.g. EDUP/Panda, or an internal Intel AX210) for the hotspot to broadcast.
+
 **Tooling:** Clonezilla, restored/saved to a USB. On a Dell OptiPlex the one-time
-boot-menu key is **F12**; a Lenovo ThinkCentre is also **F12** (BIOS = F1).
+boot-menu key is **F12**; a Lenovo ThinkCentre is also **F12** (BIOS = F1). On a
+Lenovo you may need BIOS → **disable Secure Boot** + move the USB out of "Excluded
+from boot order" + (if the stick won't show) enable **CSM / UEFI+Legacy**.
+
+**⚠️ macOS can't write these FAT sticks** (a known macOS Sequoia bug mounts FAT32
+read-only, worse with two USBs plugged in). So you **cannot** prep a code USB on
+the Mac. Get new code onto a workbench box **over the network instead** (Wi-Fi +
+`git pull`, or `curl` a bootstrap; the build session used a gist + `curl … | bash`),
+or push it via `ssh` (base64 → the box; `/opt/memoria-gateway` is owned by
+`potaton00b`, no sudo to write there). **Delete stale images** from the golden-image
+stick inside Clonezilla (Linux, writes FAT fine): drop to the shell (end-menu
+`cmd`, or Ctrl+Alt+F2) → `sudo rm -rf /home/partimag/<old-image-folder>`.
 
 **Two kinds of image — do not confuse them:**
 - **Plain clone (IMAGE-A):** a `savedisk` of a live box as-is. It carries that
@@ -252,10 +286,19 @@ boot-menu key is **F12**; a Lenovo ThinkCentre is also **F12** (BIOS = F1).
   `deploy/prep-golden-image.sh` before capture. Every clone self-onboards.
 
 **The per-box things that MUST differ between units** (all handled by firstboot):
-machine-id, SSH host keys, `gateway_token` (in `cameras.json`), the reverse-SSH
-**tunnel port** (baked unit hardcodes 22001), and the saved **Wi-Fi** (deleted so
-the hotspot raises). Firmware **AC-recovery does NOT travel in any image** — set
-it per box (Dell: sysfs, §10; Lenovo: BIOS → Power → After Power Loss → On).
+machine-id, SSH host keys, `gateway_token` (in `cameras.json` **and synced into
+the memoria-setup unit** so the portal provisions under it), the reverse-SSH
+**tunnel port** (baked unit hardcodes 22001; backend assigns the real one, §13),
+the portal **self-signed cert** (deleted by prep → regenerated per box), and the
+saved **Wi-Fi** (deleted so the hotspot raises). Firmware **AC-recovery does NOT
+travel in any image** — set it per box (Dell: sysfs, §10; Lenovo: BIOS → Power →
+After Power Loss → On).
+
+**Re-generalizing an already-onboarded box (to re-capture) can be done REMOTELY:**
+`ssh` in, push any fixed files (base64), then run prep detached so it survives the
+Wi-Fi drop + powers off: `sudo bash -c 'setsid bash -c "bash …/prep-golden-image.sh
+>/tmp/prep.log 2>&1; poweroff" </dev/null >/dev/null 2>&1 &'`. Then you only do the
+Clonezilla `savedisk` at the machine. (This is how `memoria-template-final` was made.)
 
 **Build a template — never on the live OptiPlex (prep wipes its identity + Wi-Fi).
 Use a disposable workbench box (e.g. the Lenovo), at its console (no ethernet
