@@ -318,13 +318,41 @@ class CameraSource:
         """Read the audio-only ffmpeg's PCM (48kHz mono s16le) in 10ms frames and
         fan each to every currently-publishing patient's LiveKit audio source —
         the audio analogue of _reader_loop. On failure it logs + returns (does NOT
-        raise), so a flaky audio pull never disturbs the video pipeline."""
+        raise), so a flaky audio pull never disturbs the video pipeline.
+
+        A/V SYNC (fix 2026-07-13): audio must NEVER hold a backlog. capture_frame
+        paces playout at real time, so any bytes that pile up in the pipe
+        (startup skew between the two RTSP sessions, event-loop stalls) become a
+        PERMANENT constant audio delay — the observed 2-3s lip-sync lag on the
+        live feed. Track consumed audio-time against wall-clock; when it falls
+        behind, DROP chunks (consume without forwarding) until caught up — a
+        one-time audible skip instead of a forever lag."""
         samples = _AUDIO_RATE // 100          # 480 samples = 10ms
         chunk = samples * 2 * _AUDIO_CH       # 960 bytes (s16le mono)
+        START_DROP_S = 0.35  # begin dropping when audio trails wall-clock this far
+        STOP_DROP_S = 0.05   # drain down to here (hysteresis avoids flapping)
+        t0 = None            # wall-clock at first chunk
+        fwd_s = 0.0          # seconds of audio consumed (forwarded OR dropped)
+        dropping = False
+        drop_start_s = 0.0
         try:
             while True:
                 buf = await asyncio.wait_for(
                     proc.stdout.readexactly(chunk), timeout=8.0)
+                now = time.monotonic()
+                if t0 is None:
+                    t0 = now
+                behind = (now - t0) - fwd_s
+                fwd_s += 0.010
+                if not dropping and behind > START_DROP_S:
+                    dropping = True
+                    drop_start_s = fwd_s
+                if dropping:
+                    if behind > STOP_DROP_S:
+                        continue          # drop this chunk — drains the backlog
+                    dropping = False
+                    log(f"[{_rtsp_host(self.rtsp)}] audio: dropped "
+                        f"{fwd_s - drop_start_s:.1f}s backlog to restore A/V sync")
                 frame = rtc.AudioFrame(buf, _AUDIO_RATE, _AUDIO_CH, samples)
                 for pub in list(self.publishers.values()):
                     if pub.publishing and pub.audio_source is not None:
