@@ -92,7 +92,24 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 </div>
 
 <script>
+// Per-brand RTSP defaults. The stream PATH is model-specific (Tapo serves
+// /stream1; Trueview serves /ch0_0.264) — picking a model pre-fills path +
+// default credentials, and every field stays editable ("Custom") so a new
+// brand never needs a code change to get a box installed.
+const PROFILES = {
+  tapo:     {title:'Tapo',     path:'/stream1',   user:'camera1', pass:'qwerty123'},
+  trueview: {title:'Trueview', path:'/ch0_0.264', user:'admin',   pass:''},
+};
+const DEFAULT_PROFILE = 'tapo';
 let found = [];
+function applyProfile(i){
+  const p = PROFILES[document.getElementById('prof'+i).value];
+  if(!p) return;   // "custom" — leave fields as typed
+  document.getElementById('path'+i).value = p.path;
+  document.getElementById('user'+i).value = p.user;
+  document.getElementById('pass'+i).value = p.pass;
+  repreview(i, found[i].ip);
+}
 async function discover(){
   document.getElementById('dstat').textContent = 'scanning…';
   document.getElementById('dbtn').disabled = true;
@@ -102,17 +119,23 @@ async function discover(){
   if(!found.length){ box.innerHTML='<p class="muted">No cameras found on this subnet.</p>'; }
   found.forEach((c,i)=>{
     const badge = c.already ? ' <span class="badge">already added</span>' : '';
+    const d = PROFILES[DEFAULT_PROFILE];
     box.insertAdjacentHTML('beforeend',
       `<div class="cam">
          <input type="checkbox" id="sel${i}" ${c.already?'':'checked'} style="margin-top:48px">
          <img id="thumb${i}" class="thumb" alt="loading preview…"
-              src="/api/snapshot?ip=${encodeURIComponent(c.ip)}&user=camera1&pass=qwerty123"
-              onerror="this.classList.add('thumberr');this.alt='no preview — check user/pass, then ↻'">
+              src="/api/snapshot?ip=${encodeURIComponent(c.ip)}&user=${encodeURIComponent(d.user)}&pass=${encodeURIComponent(d.pass)}&path=${encodeURIComponent(d.path)}"
+              onerror="this.classList.add('thumberr');this.alt='no preview — check user/pass/path, then ↻'">
          <div class="caminfo">
            <div><b>${c.ip}</b> <span class="muted">RTSP${c.onvif?' + ONVIF':''}</span>${badge}</div>
-           <div>name <input id="name${i}" value="Room ${i+1}" size="12"></div>
-           <div>user <input id="user${i}" value="camera1" size="9">
-                pass <input id="pass${i}" type="text" value="qwerty123" size="9">
+           <div>name <input id="name${i}" value="Room ${i+1}" size="12">
+                model <select id="prof${i}" onchange="applyProfile(${i})">
+                  ${Object.keys(PROFILES).map(k=>`<option value="${k}"${k===DEFAULT_PROFILE?' selected':''}>${PROFILES[k].title}</option>`).join('')}
+                  <option value="custom">Custom</option></select></div>
+           <div>user <input id="user${i}" value="${d.user}" size="9">
+                pass <input id="pass${i}" type="text" value="${d.pass}" size="9">
+                path <input id="path${i}" value="${d.path}" size="10"
+                      onchange="document.getElementById('prof'+${i}).value='custom'">
                 <button type="button" class="mini" onclick="repreview(${i},'${c.ip}')">↻ preview</button></div>
          </div>
        </div>`);
@@ -124,10 +147,11 @@ async function discover(){
 function repreview(i, ip){
   const u=document.getElementById('user'+i).value;
   const p=document.getElementById('pass'+i).value;
+  const pa=document.getElementById('path'+i).value;
   const img=document.getElementById('thumb'+i);
   img.classList.remove('thumberr'); img.alt='loading preview…';
   img.src='/api/snapshot?ip='+encodeURIComponent(ip)+'&user='+encodeURIComponent(u)
-         +'&pass='+encodeURIComponent(p)+'&t='+Date.now();
+         +'&pass='+encodeURIComponent(p)+'&path='+encodeURIComponent(pa)+'&t='+Date.now();
 }
 async function provision(){
   document.getElementById('pstat').textContent = 'provisioning…';
@@ -136,7 +160,8 @@ async function provision(){
   found.forEach((c,i)=>{ if(document.getElementById('sel'+i).checked){
     cams.push({ip:c.ip, mac:c.mac, name:document.getElementById('name'+i).value,
       rtsp_user:document.getElementById('user'+i).value,
-      rtsp_pass:document.getElementById('pass'+i).value, icon_name:'tv'}); }});
+      rtsp_pass:document.getElementById('pass'+i).value,
+      rtsp_path:document.getElementById('path'+i).value, icon_name:'tv'}); }});
   const body = {email:document.getElementById('email').value, cameras:cams};
   const r = await fetch('/api/provision',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)});
@@ -185,12 +210,25 @@ def provision_via_email(email, name, icon_name):
         {"Authorization": f"Bearer {GATEWAY_TOKEN}"})
 
 
-def grab_snapshot(ip, user, pw):
+def build_rtsp_url(ip, user, pw, path):
+    """The stream path is camera-model-specific (Tapo: /stream1, Trueview:
+    /ch0_0.264) and comes from the portal UI. Credentials are percent-encoded so
+    a password containing @ / : can't corrupt the URL."""
+    path = (path or "/stream1").strip()
+    if not path.startswith("/"):
+        path = "/" + path
+    user = urllib.parse.quote(user or "", safe="")
+    pw = urllib.parse.quote(pw or "", safe="")
+    return f"rtsp://{user}:{pw}@{ip}:554{path}"
+
+
+def grab_snapshot(ip, user, pw, path):
     """One small JPEG frame from a camera's RTSP so the installer can SEE which
-    physical room each (identical) Tapo points at — the only reliable way to tell
-    them apart, since IP/hardware don't say which room. 200px wide, ~5s cap. One
-    short-lived RTSP connection; fine alongside the gateway's own single pull."""
-    rtsp = f"rtsp://{user}:{pw}@{ip}:554/stream1"
+    physical room each (identical) camera points at — the only reliable way to
+    tell them apart, since IP/hardware don't say which room. 200px wide, ~5s cap.
+    One short-lived RTSP connection; fine alongside the gateway's own single
+    pull. Doubles as validation that user/pass/path are right for this model."""
+    rtsp = build_rtsp_url(ip, user, pw, path)
     out = subprocess.run(
         # No -rw_timeout: this ffmpeg build rejects it as an input option (the
         # 12s subprocess cap is the backstop). -rtsp_transport tcp before -i.
@@ -267,12 +305,16 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             self._send(200, PAGE, "text/html")
         elif parsed.path == "/api/snapshot":
-            q = parse_qs(parsed.query)
+            # keep_blank_values: Trueview's default password is EMPTY — without
+            # it parse_qs drops `pass=` and we'd silently fall back to the Tapo
+            # default and 401 against the camera.
+            q = parse_qs(parsed.query, keep_blank_values=True)
             ip = (q.get("ip") or [""])[0]
             user = (q.get("user") or ["camera1"])[0]
             pw = (q.get("pass") or ["qwerty123"])[0]
+            path = (q.get("path") or ["/stream1"])[0]
             try:
-                self._send(200, grab_snapshot(ip, user, pw), "image/jpeg")
+                self._send(200, grab_snapshot(ip, user, pw, path), "image/jpeg")
             except Exception as e:  # noqa: BLE001
                 self._send(502, {"error": str(e)})
         else:
@@ -307,8 +349,8 @@ class Handler(BaseHTTPRequestHandler):
                     if cam["ip"] in ips or (cam.get("mac") and cam["mac"] in macs):
                         skipped.append(cam["ip"])
                         continue
-                    rtsp = (f"rtsp://{cam['rtsp_user']}:{cam['rtsp_pass']}"
-                            f"@{cam['ip']}:554/stream1")
+                    rtsp = build_rtsp_url(cam["ip"], cam["rtsp_user"],
+                                          cam["rtsp_pass"], cam.get("rtsp_path"))
                     pr = provision_via_email(email, cam["name"],
                                              cam.get("icon_name", "tv"))
                     # One physical camera -> one identity per the caregiver's
