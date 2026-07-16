@@ -1,5 +1,5 @@
 {
-  "_comment": "SHAPE ONLY. The real cameras.json is per-box, written by the setup portal, and gitignored.",
+  "_comment": "SHAPE ONLY. The real cameras.json is per-box, written by the setup portal, and gitignored. The rtsp stream path is camera-model-specific (Tapo: /stream1, Trueview: /ch0_0.264) — set per camera in the setup portal.",
   "livekit_url": "wss://<project>.livekit.cloud",
   "livekit_api_key": "<LIVEKIT_API_KEY>",
   "livekit_api_secret": "<LIVEKIT_API_SECRET>",
