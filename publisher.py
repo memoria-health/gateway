@@ -126,6 +126,15 @@ def _rtsp_host(url):
     return m.group(1) if m else None
 
 
+def _kill_quiet(proc):
+    """kill() raises ProcessLookupError if the process already exited — the
+    normal case when we're tearing down BECAUSE ffmpeg died."""
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 def _rtsp_with_host(url, host):
     return re.sub(r"(@)[^:/@]+", r"\g<1>" + host, url, count=1)
 
@@ -164,7 +173,14 @@ class Publisher:
                 log(f"[{self.identity}] LiveKit dropped — will rejoin")
 
         room.on("disconnected", _on_disconnected)
-        await room.connect(self.src.lk_url, token)
+        # PUBLISH-ONLY connection: the gateway consumes nothing from the room.
+        # The SDK's auto-subscribe default made every publisher decode the
+        # caregiver's mic track during a Call (N patients x cameras of pure
+        # waste) — enough extra load on a weak host (Pi) to stall the event
+        # loop past the audio loop's read timeout and kill audio. If camera-
+        # speaker talk ever lands, subscribe SELECTIVELY at call time instead.
+        await room.connect(self.src.lk_url, token,
+                           rtc.RoomOptions(auto_subscribe=False))
         source = rtc.VideoSource(self.src.w, self.src.h)
         track = rtc.LocalVideoTrack.create_video_track("memoria", source)
         await room.local_participant.publish_track(
@@ -290,15 +306,11 @@ class CameraSource:
         cmd = build_ffmpeg_cmd(self.rtsp, self.fps, self.logo)
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        # Second ffmpeg: audio-only pull, fanned to publishers by _audio_loop.
-        aproc = await asyncio.create_subprocess_exec(
-            *build_audio_ffmpeg_cmd(self.rtsp),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         reader = asyncio.create_task(self._reader_loop(proc))
         control = asyncio.create_task(self._control_loop())
         # Audio runs ALONGSIDE but does NOT gate the pipeline: an audio failure
-        # logs + exits on its own, without tearing down video (video is priority).
-        audio = asyncio.create_task(self._audio_loop(aproc))
+        # is retried by its own supervisor without disturbing video.
+        audio = asyncio.create_task(self._audio_supervisor())
         try:
             done, _ = await asyncio.wait(
                 {reader, control}, return_when=asyncio.FIRST_EXCEPTION)
@@ -309,10 +321,36 @@ class CameraSource:
             control.cancel()
             audio.cancel()
             await asyncio.gather(reader, control, audio, return_exceptions=True)
-            proc.kill()
-            aproc.kill()
+            _kill_quiet(proc)
             for pub in list(self.publishers.values()):
                 await pub.teardown()
+
+    async def _audio_supervisor(self):
+        """Keep the audio pull alive for the life of the video pipeline. The
+        old design ran _audio_loop ONCE and gave up on any failure ("recovers
+        on next pipeline restart") — but the pipeline only restarts when VIDEO
+        fails, so on a healthy stream a single 8s audio stall meant PERMANENT
+        silence (seen in the field: a Call press loaded a Pi past the read
+        timeout and audio never returned). Respawn the audio ffmpeg with
+        backoff instead — a failure is now a blip, not an outage. Backoff
+        resets after a healthy minute; a camera with no audio track settles
+        into a quiet 30s retry cadence."""
+        backoff = 2
+        while True:
+            aproc = await asyncio.create_subprocess_exec(
+                *build_audio_ffmpeg_cmd(self.rtsp),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL)
+            started = time.monotonic()
+            try:
+                await self._audio_loop(aproc)  # returns only on failure
+            finally:
+                _kill_quiet(aproc)
+            if time.monotonic() - started >= 60:
+                backoff = 2
+            log(f"[{_rtsp_host(self.rtsp)}] audio: restarting pull in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
 
     async def _audio_loop(self, proc):
         """Read the audio-only ffmpeg's PCM (48kHz mono s16le) in 10ms frames and
@@ -364,7 +402,7 @@ class CameraSource:
             raise
         except Exception as e:  # noqa: BLE001
             log(f"[{_rtsp_host(self.rtsp)}] audio stopped ({e!r}) — video "
-                f"unaffected; recovers on next pipeline restart")
+                f"unaffected; supervisor will respawn the audio pull")
 
     async def _control_loop(self):
         """Match EACH publisher's LiveKit connection to its desired_state. ffmpeg
