@@ -26,16 +26,22 @@ def _normalize_mac(mac):
 
 
 def _mac_for_ip(ip):
-    """The camera's MAC from the ARP table (populated by the port probe just
-    before). Stable across IP changes — the anchor for re-discovery. `arp -n`
-    works the same on macOS and the Linux mini-PC."""
-    try:
-        out = subprocess.run(
-            ["arp", "-n", ip], capture_output=True, text=True, timeout=3).stdout
-    except Exception:  # noqa: BLE001
-        return None
-    m = re.search(r"([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})", out)
-    return _normalize_mac(m.group(1)) if m else None
+    """The camera's MAC from the neighbor/ARP table (populated by the port
+    probe just before). Stable across IP changes — the anchor for
+    re-discovery. `ip neigh` first: the gateway's Ubuntu image ships without
+    `arp` (net-tools), which silently left every provisioned camera with
+    mac=null and broke relocation. `arp -n` is the macOS fallback (no `ip`
+    there). A FAILED neighbor entry has no lladdr, so it falls through."""
+    for cmd in (["ip", "neigh", "show", ip], ["arp", "-n", ip]):
+        try:
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=3).stdout
+        except Exception:  # noqa: BLE001
+            continue
+        m = re.search(r"([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})", out)
+        if m:
+            return _normalize_mac(m.group(1))
+    return None
 
 
 def local_subnet():
