@@ -436,10 +436,23 @@ class CameraSource:
         # Motion = fraction of sampled pixels that changed a LOT. Robust to the
         # Tapo's heavy sensor noise (a small diff spread over the whole frame,
         # which mean-SAD conflated with a walking person). PIXEL_DELTA rejects
-        # noise (per-pixel ~1-5); MOTION_FRAC is how much of the frame must move.
-        PIXEL_DELTA = 30
-        MOTION_FRAC = 0.0025  # sensitive: idle >30 floor ~0.2%; false wakes are
-                              # cheap (worker re-checks for people, sleeps if none)
+        # noise; MOTION_FRAC is how much of the frame must move.
+        #
+        # PIXEL_DELTA 30→45 (2026-07-17): the old value was calibrated on
+        # DAYTIME noise (idle >30 floor ~0.2% vs 0.25% trip — 0.05pp of
+        # headroom). IR night mode's gain fattens the noise tail past the
+        # line: measured on the Nagpur cam over a full night, 97.4% of
+        # ticks tripped >30 (p50 0.32%, max 0.57%) — the backend paid for
+        # Gemini calls on an empty office all night (~$31/day). At >45 the
+        # same night reads p99 0.09% / max 0.13% — 2x under the line —
+        # while a real scene change measured 40%+ and a person is far
+        # above that. Day ambient (PC LED flicker, dawn) reads 0.03-0.04%
+        # at >45. This hint is additionally VERIFIED backend-side by
+        # block-motion (nemara-backend services/detection/motion.py), so
+        # this constant is hardening, not the last line of defense.
+        PIXEL_DELTA = 45
+        MOTION_FRAC = 0.0025  # sensitive: false wakes are cheap (worker
+                              # re-checks for people, sleeps if none)
         MOTION_HOLD_S = 4.0
         STALL_TIMEOUT = 4.0   # no frame this long = dead stream (unplug/wifi)
         while True:
