@@ -111,12 +111,21 @@ def build_audio_ffmpeg_cmd(rtsp):
     connection from the video pull, but G.711 is tiny and the camera tolerates
     the 2 concurrent clients. Low-delay flags + a causal soft-clip keep audio
     latency low so it stays closer in sync with video."""
-    # The Tapo mic is quiet — boost ~5x. asoftclip (tanh) is a CAUSAL soft limiter
-    # (no lookahead delay, unlike alimiter) so loud sounds round off instead of
-    # hard-clipping, WITHOUT adding latency.
+    # The Tapo mic is quiet — boost ~5x by default. asoftclip (tanh) is a CAUSAL
+    # soft limiter (no lookahead delay, unlike alimiter) so loud sounds round
+    # off instead of hard-clipping, WITHOUT adding latency. Hotter mics
+    # (Trueview) overdrive the 5x into the clipper and sound garbled — set a
+    # per-box override: `echo 1 > /opt/memoria-gateway/.audio-gain` (float;
+    # missing/invalid file keeps the Tapo default).
+    gain = 5.0
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        gain = float(open(os.path.join(here, ".audio-gain")).read().strip())
+    except Exception:  # noqa: BLE001
+        pass
     return ["ffmpeg", "-nostdin", "-fflags", "nobuffer", "-flags", "low_delay",
             "-rtsp_transport", "tcp", "-i", rtsp,
-            "-vn", "-map", "0:a", "-af", "volume=5,asoftclip=type=tanh",
+            "-vn", "-map", "0:a", "-af", f"volume={gain},asoftclip=type=tanh",
             "-ar", str(_AUDIO_RATE), "-ac", str(_AUDIO_CH),
             "-f", "s16le", "-"]
 
