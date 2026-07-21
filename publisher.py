@@ -375,13 +375,31 @@ class CameraSource:
         drop_start_s = 0.0
         try:
             while True:
+                t_read = time.monotonic()
                 buf = await asyncio.wait_for(
                     proc.stdout.readexactly(chunk), timeout=8.0)
                 now = time.monotonic()
+                starved = (now - t_read) > 0.004
                 if t0 is None:
                     t0 = now
                 behind = (now - t0) - fwd_s
                 fwd_s += 0.010
+                # SOURCE-GAP REBASE (fix 2026-07-21): `behind` is only real,
+                # drainable backlog while the pipe has data QUEUED. If this
+                # read had to WAIT (pipe ran dry), we are at the live edge —
+                # accumulated `behind` is a SOURCE gap (a camera stall: audio
+                # that never existed), not backlog, and can never be drained.
+                # Without this, one stall engaged the dropper permanently and
+                # it silently discarded 100% of live audio while ffmpeg + this
+                # loop looked healthy (Nagpur Trueview, flaky-wifi stalls).
+                # Rebase the clock to the live edge instead of dropping.
+                if starved and behind > STOP_DROP_S:
+                    t0 = now - fwd_s
+                    behind = 0.0
+                    if dropping:
+                        dropping = False
+                        log(f"[{_rtsp_host(self.rtsp)}] audio: clock rebased "
+                            f"after source gap — resuming live audio")
                 if not dropping and behind > START_DROP_S:
                     dropping = True
                     drop_start_s = fwd_s
