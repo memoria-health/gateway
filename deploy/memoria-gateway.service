@@ -1,29 +1,7 @@
-# Real mini-PC service (Linux). Boots the gateway on power-on and restarts it
-# forever. This is the production equivalent of run.sh / the Mac launchd job.
-#
-# Install on the mini-PC:
-#   sudo cp deploy/memoria-gateway.service /etc/systemd/system/
-#   sudo systemctl enable --now memoria-gateway
-# Inspect:  systemctl status memoria-gateway   journalctl -u memoria-gateway -f
 
-[Unit]
-Description=Memoria Gateway (Tapo RTSP -> LiveKit)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/memoria-gateway
-ExecStart=/opt/memoria-gateway/.venv/bin/python publisher.py
-Restart=always
-# Exponential backoff 2s -> 30s (matches run.sh). RestartSteps/RestartMaxDelaySec
-# need systemd >= 254; on older systemd these are ignored and RestartSec=2 (fixed)
-# applies — still fine, just not exponential.
-RestartSec=2
-RestartSteps=4
-RestartMaxDelaySec=30
-# Survive transient network loss without spinning the restart counter:
-StartLimitIntervalSec=0
-
-[Install]
-WantedBy=multi-user.target
+# ── Source-controlled copy of the box's unit (captured 2026-07-27) ──
+# StartLimitIntervalSec=0 is LOAD-BEARING: the publisher's watchdog
+# exits ON PURPOSE during outages (zombie-transport detection); the
+# default start-limit would mark the service failed after ~5 rapid
+# exits and leave the home blind until a human intervened. Never
+# remove it.

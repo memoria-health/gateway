@@ -166,6 +166,9 @@ class Publisher:
         self.audio_source = None    # rtc.AudioSource
         self.publishing = False
         self._lk_dropped = False
+        # Watchdog bookkeeping (2026-07-27): first moment this publisher
+        # was observed NOT (connected + publishing); None while healthy.
+        self.unhealthy_since = None
         self.last_pub = 0.0
 
     async def connect(self):
@@ -192,8 +195,37 @@ class Publisher:
                            rtc.RoomOptions(auto_subscribe=False))
         source = rtc.VideoSource(self.src.w, self.src.h)
         track = rtc.LocalVideoTrack.create_video_track("memoria", source)
-        await room.local_participant.publish_track(
-            track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA))
+        # SINGLE-ENCODING switch (2026-07-19, flag-file gated, default
+        # OFF = today's behavior). By default the SDK publishes a
+        # simulcast LADDER (tiny/medium/full) and the SFU silently
+        # downshifts subscribers between rungs whenever its congestion
+        # estimate twitches — measured backend-side as the sharp↔blurry
+        # flapping that blinds YOLO/face matching (soak #2: blur↔identity
+        # r=0.52). `touch /opt/memoria-gateway/.simulcast-off` +
+        # service restart publishes ONE encoding instead: constant
+        # quality; congestion then shows as frame drops (sharp-but-
+        # fewer beats many-mush for detection). Trade-off to decide
+        # before flipping: every subscriber (caregiver app on cellular
+        # included) then receives the full stream — no small rung.
+        # Explicit top-layer encoding (Sunny's benchmark finding,
+        # 2026-07-27): the bare defaults cap the top simulcast layer at
+        # 720p even from a 1080p Tapo source — prod analysis was
+        # silently sub-native. Pin the encoding so the top layer stays
+        # the source resolution; 4 Mbps so the encoder isn't forced to
+        # crush the extra pixels.
+        publish_opts = rtc.TrackPublishOptions(
+            source=rtc.TrackSource.SOURCE_CAMERA,
+            video_encoding=rtc.VideoEncoding(
+                max_framerate=int(round(self.src.fps or 15)),
+                max_bitrate=4_000_000,
+            ),
+        )
+        if os.path.exists(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), ".simulcast-off")):
+            publish_opts.simulcast = False
+            log(f"[{self.identity}] simulcast OFF — single encoding "
+                f"({self.src.w}x{self.src.h})")
+        await room.local_participant.publish_track(track, publish_opts)
         # Audio track — fed by the CameraSource's shared audio pull (fanned out).
         audio_source = rtc.AudioSource(
             _AUDIO_RATE, _AUDIO_CH, queue_size_ms=_AUDIO_QUEUE_MS)
@@ -258,6 +290,33 @@ class CameraSource:
         if pub is not None:
             await pub.teardown()
             log(f"[{identity}] detached from {_rtsp_host(self.rtsp)}")
+
+    async def _watchdog(self):
+        while True:
+            await asyncio.sleep(WD_POLL_S)
+            now = time.monotonic()
+            for src, _task in list(self.sources.values()):
+                for ident, pub in list(getattr(src, "publishers", {}).items()):
+                    if pub.desired != "connected":
+                        pub.unhealthy_since = None
+                        continue
+                    healthy = (
+                        pub.room is not None
+                        and pub.publishing
+                        and pub.room.connection_state
+                        == rtc.ConnectionState.CONN_CONNECTED
+                    )
+                    if healthy:
+                        pub.unhealthy_since = None
+                    elif pub.unhealthy_since is None:
+                        pub.unhealthy_since = now
+                    elif now - pub.unhealthy_since > WD_LK_UNHEALTHY_S:
+                        log(f"[{ident}] WATCHDOG: LiveKit unhealthy "
+                            f"{now - pub.unhealthy_since:.0f}s "
+                            f"(room={'yes' if pub.room else 'no'} "
+                            f"publishing={pub.publishing}) — exiting for "
+                            f"a clean systemd restart")
+                        os._exit(3)
 
     async def run(self):
         backoff = 1
@@ -529,6 +588,23 @@ class CameraSource:
                         except Exception:  # noqa: BLE001
                             pass
                         pub.last_pub = now
+
+
+# ── Process watchdog (2026-07-27, the wifi-glitch lesson) ────────────
+# The per-camera supervisor + rejoin loop handle every failure that
+# RAISES. What they cannot see is the zombie transport: the SDK's
+# "disconnected" event never fires, publishing stays True, and
+# capture_frame swallows frames into a dead WebRTC connection — the
+# gateway ran 4d10h in exactly that state, blind and "healthy".
+# This watchdog judges OUTCOME: a publisher that wants to be connected
+# but is not verifiably (room + publishing + CONN_CONNECTED) for
+# WD_LK_UNHEALTHY_S gets the whole process killed. systemd restarts us
+# (Restart=always + StartLimitIntervalSec=0 — it must NEVER declare us
+# hopeless), and a from-scratch boot rebuilds every connection. During
+# a long outage we cycle every ~minute until the network returns, then
+# the next boot succeeds end-to-end with no human involved.
+WD_POLL_S = 5.0
+WD_LK_UNHEALTHY_S = 45.0
 
 
 class RosterManager:
