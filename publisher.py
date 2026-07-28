@@ -157,7 +157,16 @@ def _rtsp_with_host(url, host):
 # ParticipantTrackPermission only takes EXACT identities (no prefix match), so
 # when private we maintain an allow-list of the detector_worker_* participants
 # currently in the room and re-apply it whenever a new one joins.
+#
+# 2026-07-27: the identity service ("identity-service") is on the AI side of
+# the privacy line — it must see private rooms to keep the patient seat
+# working there (patient-elsewhere gating, night coverage). Caregiver
+# identities stay denied at the SFU regardless. It gets its own prefix
+# instead of a detector_worker_ name because the backend's startup zombie
+# reaper kicks detector_worker_* participants it didn't spawn.
 _DETECTOR_WORKER_PREFIX = "detector_worker_"
+_IDENTITY_SERVICE_PREFIX = "identity-service"
+_AI_SUBSCRIBER_PREFIXES = (_DETECTOR_WORKER_PREFIX, _IDENTITY_SERVICE_PREFIX)
 
 
 class Publisher:
@@ -196,14 +205,14 @@ class Publisher:
                 rtc.ParticipantTrackPermission(
                     participant_identity=p.identity, allow_all=True)
                 for p in room.remote_participants.values()
-                if p.identity.startswith(_DETECTOR_WORKER_PREFIX)
+                if p.identity.startswith(_AI_SUBSCRIBER_PREFIXES)
             ]
             room.local_participant.set_track_subscription_permissions(
                 allow_all_participants=False,
                 participant_permissions=allowed)
             if not quiet:
                 log(f"[{self.identity}] PRIVACY ON — caregivers blocked at SFU; "
-                    f"{len(allowed)} detector worker(s) allow-listed")
+                    f"{len(allowed)} AI subscriber(s) allow-listed")
         else:
             room.local_participant.set_track_subscription_permissions(
                 allow_all_participants=True)
@@ -236,7 +245,7 @@ class Publisher:
             # subscribe. Caregivers joining need nothing: they're already
             # denied by allow_all_participants=False. Failure here fails
             # CLOSED (the room stays restricted; only the new worker waits).
-            if self.privacy and p.identity.startswith(_DETECTOR_WORKER_PREFIX):
+            if self.privacy and p.identity.startswith(_AI_SUBSCRIBER_PREFIXES):
                 try:
                     self._apply_permissions_to(room)
                 except Exception as e:  # noqa: BLE001
