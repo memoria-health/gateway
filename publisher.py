@@ -148,6 +148,18 @@ def _rtsp_with_host(url, host):
     return re.sub(r"(@)[^:/@]+", r"\g<1>" + host, url, count=1)
 
 
+# ── Privacy enforcement (2026-07-27, pinned contract) ────────────────────────
+# The roster gains `privacy_enabled: bool` per camera. When true, NO caregiver
+# (identity prefix "caregiver_") may receive this publisher's live video/audio;
+# only analysis workers (identity prefix "detector_worker_") may subscribe.
+# Enforced at the SFU via publisher-set track subscription permissions
+# (LocalParticipant.set_track_subscription_permissions). The SDK's
+# ParticipantTrackPermission only takes EXACT identities (no prefix match), so
+# when private we maintain an allow-list of the detector_worker_* participants
+# currently in the room and re-apply it whenever a new one joins.
+_DETECTOR_WORKER_PREFIX = "detector_worker_"
+
+
 class Publisher:
     """One LiveKit destination for a physical camera. In the caregiver model a
     single physical camera has one Publisher PER patient (each its own LiveKit
@@ -156,11 +168,12 @@ class Publisher:
     many patients view it. desired_state is per-publisher — each patient's
     dashboard connects/disconnects independently."""
 
-    def __init__(self, *, identity, room_name, src):
+    def __init__(self, *, identity, room_name, src, privacy=False):
         self.identity = identity
         self.room_name = room_name
         self.src = src              # back-ref: LiveKit creds + frame geometry
         self.desired = "disconnected"   # pushed by the manager each roster poll
+        self.privacy = privacy      # roster privacy_enabled — pushed each poll
         self.room = None
         self.lk_source = None       # rtc.VideoSource
         self.audio_source = None    # rtc.AudioSource
@@ -170,6 +183,37 @@ class Publisher:
         # was observed NOT (connected + publishing); None while healthy.
         self.unhealthy_since = None
         self.last_pub = 0.0
+
+    def _apply_permissions_to(self, room, quiet=False):
+        """Push this publisher's subscription permissions to the SFU (sync FFI
+        call; raises on failure so callers can fail CLOSED). Private → deny all,
+        allow-list = exactly the detector_worker_* participants currently in the
+        room (allow_all=True per entry covers BOTH the video and audio tracks).
+        Not private → allow everyone (also restores after a privacy→off flip).
+        `quiet` suppresses the log line for the every-poll re-assert."""
+        if self.privacy:
+            allowed = [
+                rtc.ParticipantTrackPermission(
+                    participant_identity=p.identity, allow_all=True)
+                for p in room.remote_participants.values()
+                if p.identity.startswith(_DETECTOR_WORKER_PREFIX)
+            ]
+            room.local_participant.set_track_subscription_permissions(
+                allow_all_participants=False,
+                participant_permissions=allowed)
+            if not quiet:
+                log(f"[{self.identity}] PRIVACY ON — caregivers blocked at SFU; "
+                    f"{len(allowed)} detector worker(s) allow-listed")
+        else:
+            room.local_participant.set_track_subscription_permissions(
+                allow_all_participants=True)
+
+    def apply_permissions(self, quiet=False):
+        """Re-apply permissions to the live room (privacy flag flipped by the
+        roster, or a detector worker joined). No-op while disconnected — the
+        next connect() applies the current flag before publishing."""
+        if self.room is not None:
+            self._apply_permissions_to(self.room, quiet=quiet)
 
     async def connect(self):
         token = (api.AccessToken(self.src.api_key, self.src.api_secret)
@@ -185,6 +229,41 @@ class Publisher:
                 log(f"[{self.identity}] LiveKit dropped — will rejoin")
 
         room.on("disconnected", _on_disconnected)
+
+        def _on_participant_connected(p):
+            # Exact-identity allow-list means a detector worker that joins
+            # AFTER we applied permissions isn't on it yet — re-apply so it can
+            # subscribe. Caregivers joining need nothing: they're already
+            # denied by allow_all_participants=False. Failure here fails
+            # CLOSED (the room stays restricted; only the new worker waits).
+            if self.privacy and p.identity.startswith(_DETECTOR_WORKER_PREFIX):
+                try:
+                    self._apply_permissions_to(room)
+                except Exception as e:  # noqa: BLE001
+                    log(f"[{self.identity}] privacy: failed to allow-list "
+                        f"{p.identity} ({e}) — room stays restricted")
+
+        room.on("participant_connected", _on_participant_connected)
+
+        def _on_reconnected(*_a):
+            # SDK-internal reconnects (livekit-rtc's Rust FFI resume/restart)
+            # bypass connect() entirely, and after a FULL restart there is no
+            # guarantee the SDK re-sends our subscription permissions — a
+            # private camera could come back allow-all. Re-apply the current
+            # state (idempotent). On failure while private, fail CLOSED:
+            # force a rejoin, and connect() re-applies permissions BEFORE
+            # any track is published.
+            try:
+                self._apply_permissions_to(room)
+            except Exception as e:  # noqa: BLE001
+                log(f"[{self.identity}] privacy re-apply after SDK reconnect "
+                    f"failed ({e})"
+                    + (" — forcing rejoin (fail closed)" if self.privacy else ""))
+                if self.privacy:
+                    self._lk_dropped = True
+                    self.publishing = False
+
+        room.on("reconnected", _on_reconnected)
         # PUBLISH-ONLY connection: the gateway consumes nothing from the room.
         # The SDK's auto-subscribe default made every publisher decode the
         # caregiver's mic track during a Call (N patients x cameras of pure
@@ -193,47 +272,71 @@ class Publisher:
         # speaker talk ever lands, subscribe SELECTIVELY at call time instead.
         await room.connect(self.src.lk_url, token,
                            rtc.RoomOptions(auto_subscribe=False))
-        source = rtc.VideoSource(self.src.w, self.src.h)
-        track = rtc.LocalVideoTrack.create_video_track("memoria", source)
-        # SINGLE-ENCODING switch (2026-07-19, flag-file gated, default
-        # OFF = today's behavior). By default the SDK publishes a
-        # simulcast LADDER (tiny/medium/full) and the SFU silently
-        # downshifts subscribers between rungs whenever its congestion
-        # estimate twitches — measured backend-side as the sharp↔blurry
-        # flapping that blinds YOLO/face matching (soak #2: blur↔identity
-        # r=0.52). `touch /opt/memoria-gateway/.simulcast-off` +
-        # service restart publishes ONE encoding instead: constant
-        # quality; congestion then shows as frame drops (sharp-but-
-        # fewer beats many-mush for detection). Trade-off to decide
-        # before flipping: every subscriber (caregiver app on cellular
-        # included) then receives the full stream — no small rung.
-        # Explicit top-layer encoding (Sunny's benchmark finding,
-        # 2026-07-27): the bare defaults cap the top simulcast layer at
-        # 720p even from a 1080p Tapo source — prod analysis was
-        # silently sub-native. Pin the encoding so the top layer stays
-        # the source resolution; 4 Mbps so the encoder isn't forced to
-        # crush the extra pixels.
-        publish_opts = rtc.TrackPublishOptions(
-            source=rtc.TrackSource.SOURCE_CAMERA,
-            video_encoding=rtc.VideoEncoding(
-                max_framerate=int(round(self.src.fps or 15)),
-                max_bitrate=4_000_000,
-            ),
-        )
-        if os.path.exists(os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), ".simulcast-off")):
-            publish_opts.simulcast = False
-            log(f"[{self.identity}] simulcast OFF — single encoding "
-                f"({self.src.w}x{self.src.h})")
-        await room.local_participant.publish_track(track, publish_opts)
-        # Audio track — fed by the CameraSource's shared audio pull (fanned out).
-        audio_source = rtc.AudioSource(
-            _AUDIO_RATE, _AUDIO_CH, queue_size_ms=_AUDIO_QUEUE_MS)
-        audio_track = rtc.LocalAudioTrack.create_audio_track(
-            "memoria-audio", audio_source)
-        await room.local_participant.publish_track(
-            audio_track,
-            rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE))
+        # PRIVACY ORDERING (fail-safe): subscription permissions are applied
+        # immediately after connect and BEFORE any publish_track below, so on a
+        # private camera there is never a window — however brief — where a
+        # caregiver could subscribe: the SFU holds the restriction before a
+        # track even exists. If this raises, connect() aborts with NOTHING
+        # published (fail closed) and the control loop retries. This also
+        # covers reconnects: every path back to publishing runs through here.
+        # Belt-and-suspenders: frames/audio only fan out once `publishing` is
+        # set at the very end of this method, i.e. always after permissions.
+        try:
+            self._apply_permissions_to(room)
+            source = rtc.VideoSource(self.src.w, self.src.h)
+            track = rtc.LocalVideoTrack.create_video_track("memoria", source)
+            # SINGLE-ENCODING switch (2026-07-19, flag-file gated, default
+            # OFF = today's behavior). By default the SDK publishes a
+            # simulcast LADDER (tiny/medium/full) and the SFU silently
+            # downshifts subscribers between rungs whenever its congestion
+            # estimate twitches — measured backend-side as the sharp↔blurry
+            # flapping that blinds YOLO/face matching (soak #2: blur↔identity
+            # r=0.52). `touch /opt/memoria-gateway/.simulcast-off` +
+            # service restart publishes ONE encoding instead: constant
+            # quality; congestion then shows as frame drops (sharp-but-
+            # fewer beats many-mush for detection). Trade-off to decide
+            # before flipping: every subscriber (caregiver app on cellular
+            # included) then receives the full stream — no small rung.
+            # Explicit top-layer encoding (Sunny's benchmark finding,
+            # 2026-07-27): the bare defaults cap the top simulcast layer at
+            # 720p even from a 1080p Tapo source — prod analysis was
+            # silently sub-native. Pin the encoding so the top layer stays
+            # the source resolution; 4 Mbps so the encoder isn't forced to
+            # crush the extra pixels.
+            publish_opts = rtc.TrackPublishOptions(
+                source=rtc.TrackSource.SOURCE_CAMERA,
+                video_encoding=rtc.VideoEncoding(
+                    max_framerate=int(round(self.src.fps or 15)),
+                    max_bitrate=4_000_000,
+                ),
+            )
+            if os.path.exists(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), ".simulcast-off")):
+                publish_opts.simulcast = False
+                log(f"[{self.identity}] simulcast OFF — single encoding "
+                    f"({self.src.w}x{self.src.h})")
+            await room.local_participant.publish_track(track, publish_opts)
+            # Audio track — fed by the CameraSource's shared audio pull
+            # (fanned out).
+            audio_source = rtc.AudioSource(
+                _AUDIO_RATE, _AUDIO_CH, queue_size_ms=_AUDIO_QUEUE_MS)
+            audio_track = rtc.LocalAudioTrack.create_audio_track(
+                "memoria-audio", audio_source)
+            await room.local_participant.publish_track(
+                audio_track,
+                rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE))
+        except BaseException:  # noqa: BLE001 — re-raised below
+            # Anything failing after a successful room.connect (permission
+            # apply, publish_track, cancellation) would otherwise leak the
+            # connected room as a GHOST participant: nothing holds a
+            # reference to it yet, so teardown() could never reach it.
+            # Best-effort leave, then let the failure propagate (the control
+            # loop retries / the caller marks us dropped).
+            try:
+                await room.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         self.room, self.lk_source, self.audio_source = room, source, audio_source
         self._lk_dropped = False
         self.publishing = True
@@ -273,15 +376,47 @@ class CameraSource:
         self.frame_us = 0
         self.frames = 0
 
-    def attach(self, identity, room_name, desired):
+    def attach(self, identity, room_name, desired, privacy=False):
         """Add/refresh a publisher. Cheap + synchronous — the control loop picks up
         a newly-attached publisher on its next tick and connects it to LiveKit."""
         pub = self.publishers.get(identity)
         if pub is None:
-            pub = Publisher(identity=identity, room_name=room_name, src=self)
+            pub = Publisher(identity=identity, room_name=room_name, src=self,
+                            privacy=privacy)
             self.publishers[identity] = pub
             log(f"[{identity}] attached to {_rtsp_host(self.rtsp)} "
-                f"(desired={desired})")
+                f"(desired={desired}, privacy={privacy})")
+        elif privacy != pub.privacy:
+            # Roster flipped privacy_enabled — re-apply on the LIVE room
+            # (set_track_subscription_permissions is a sync FFI call). If we
+            # can't apply while turning privacy ON, fail CLOSED: force a
+            # reconnect, and connect() re-applies permissions BEFORE any
+            # track is published.
+            pub.privacy = privacy
+            log(f"[{identity}] privacy_enabled -> {privacy} — updating "
+                f"subscription permissions")
+            try:
+                pub.apply_permissions()
+            except Exception as e:  # noqa: BLE001
+                log(f"[{identity}] privacy apply failed ({e})"
+                    + (" — forcing reconnect (fail closed)" if privacy else ""))
+                if privacy:
+                    pub._lk_dropped = True
+                    pub.publishing = False
+        elif privacy:
+            # Self-asserting enforcement: set_track_subscription_permissions
+            # is effectively fire-and-forget at the signal layer, so a flip
+            # that "succeeded" on a half-dead connection may never have
+            # reached the SFU. Re-apply (idempotent, cheap sync FFI) on
+            # EVERY roster poll while private — a missed flip converges
+            # within poll_seconds. Failure fails CLOSED like the flip above.
+            try:
+                pub.apply_permissions(quiet=True)
+            except Exception as e:  # noqa: BLE001
+                log(f"[{identity}] privacy re-assert failed ({e}) — forcing "
+                    f"reconnect (fail closed)")
+                pub._lk_dropped = True
+                pub.publishing = False
         pub.desired = desired
         return pub
 
@@ -291,6 +426,9 @@ class CameraSource:
             await pub.teardown()
             log(f"[{identity}] detached from {_rtsp_host(self.rtsp)}")
 
+    # DEAD CODE (pre-existing): never scheduled anywhere, and it reads
+    # `self.sources` (a RosterManager attribute CameraSource doesn't have) so
+    # it would crash if ever scheduled — left untouched intentionally.
     async def _watchdog(self):
         while True:
             await asyncio.sleep(WD_POLL_S)
@@ -629,6 +767,14 @@ class RosterManager:
 
     @staticmethod
     def _fp(cameras):
+        # Deliberately EXCLUDES privacy_enabled: this string is sent as `since`
+        # to /gateway/wait, and the backend compares it against ITS fingerprint
+        # (identity:desired_state today) — adding a field here that the backend
+        # doesn't fingerprint would make every long-poll return "changed"
+        # instantly (a request storm). Privacy flips still propagate within
+        # poll_seconds via _poll_loop, which applies the roster every cycle;
+        # if the backend answers with its own fingerprint we adopt it (see
+        # _wait_loop), so a backend-side format change self-corrects too.
         return "|".join(f"{c['livekit_identity']}:{c['desired_state']}"
                         for c in sorted(cameras, key=lambda c: c["livekit_identity"]))
 
@@ -677,11 +823,14 @@ class RosterManager:
         except Exception:  # noqa: BLE001
             pass
 
-    async def _apply(self, cameras):
+    async def _apply(self, cameras, fp=None):
         async with self._lock:
             self._reload_local()
             await self._reconcile(cameras)
-            self._fingerprint = self._fp(cameras)
+            # Prefer the backend-computed fingerprint when the response carries
+            # one — format-agnostic, so the long-poll stays quiet even if the
+            # backend fingerprints more fields than we do.
+            self._fingerprint = fp if fp is not None else self._fp(cameras)
 
     async def _poll_loop(self):
         """Steady fallback: catches adds/deletes, stamps liveness, and covers any
@@ -707,7 +856,8 @@ class RosterManager:
                 await asyncio.sleep(1)   # re-open shortly; poll_loop covers the gap
                 continue
             if resp.get("changed"):
-                await self._apply(resp.get("cameras", []))
+                await self._apply(resp.get("cameras", []),
+                                  fp=resp.get("fingerprint"))
 
     async def run(self):
         log(f"gateway up: roster (poll + long-poll) -> {self.roster_url} "
@@ -730,7 +880,10 @@ class RosterManager:
                 continue
             key = lm["rtsp"]
             grp = groups.setdefault(key, {"mac": lm.get("mac"), "pubs": {}})
-            grp["pubs"][ident] = (cam["livekit_room"], cam["desired_state"])
+            # privacy_enabled is a NEW roster field (pinned contract) — parse
+            # tolerantly so an older backend that omits it means "not private".
+            grp["pubs"][ident] = (cam["livekit_room"], cam["desired_state"],
+                                  bool(cam.get("privacy_enabled", False)))
 
         # Stop sources whose physical camera has no roster cameras left at all
         # (every sharing patient deleted in the dashboard).
@@ -746,17 +899,18 @@ class RosterManager:
         for key, grp in groups.items():
             if key not in self.sources:
                 src = CameraSource(key=key, rtsp=key, mac=grp["mac"], g=self.g)
-                for ident, (room, desired) in grp["pubs"].items():
-                    src.attach(ident, room, desired)
+                for ident, (room, desired, privacy) in grp["pubs"].items():
+                    src.attach(ident, room, desired, privacy)
                 task = asyncio.create_task(src.run())
                 self.sources[key] = (src, task)
                 log(f"[{_rtsp_host(key)}] source started — 1 RTSP pull, "
                     f"{len(grp['pubs'])} publisher(s)")
             else:
                 src, _ = self.sources[key]
-                # attach new / refresh desired_state for wanted publishers
-                for ident, (room, desired) in grp["pubs"].items():
-                    src.attach(ident, room, desired)
+                # attach new / refresh desired_state + privacy for wanted
+                # publishers (a privacy flip re-applies SFU permissions)
+                for ident, (room, desired, privacy) in grp["pubs"].items():
+                    src.attach(ident, room, desired, privacy)
                 # detach publishers this physical camera no longer serves
                 for ident in list(src.publishers):
                     if ident not in grp["pubs"]:
