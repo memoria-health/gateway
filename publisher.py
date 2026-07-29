@@ -177,12 +177,14 @@ class Publisher:
     many patients view it. desired_state is per-publisher — each patient's
     dashboard connects/disconnects independently."""
 
-    def __init__(self, *, identity, room_name, src, privacy=False):
+    def __init__(self, *, identity, room_name, src, privacy=False, audio=True):
         self.identity = identity
         self.room_name = room_name
         self.src = src              # back-ref: LiveKit creds + frame geometry
         self.desired = "disconnected"   # pushed by the manager each roster poll
         self.privacy = privacy      # roster privacy_enabled — pushed each poll
+        self.audio = audio          # patient audio_capture_enabled — False =
+                                    # facilities audio kill, no track published
         self.room = None
         self.lk_source = None       # rtc.VideoSource
         self.audio_source = None    # rtc.AudioSource
@@ -326,14 +328,24 @@ class Publisher:
                     f"({self.src.w}x{self.src.h})")
             await room.local_participant.publish_track(track, publish_opts)
             # Audio track — fed by the CameraSource's shared audio pull
-            # (fanned out).
-            audio_source = rtc.AudioSource(
-                _AUDIO_RATE, _AUDIO_CH, queue_size_ms=_AUDIO_QUEUE_MS)
-            audio_track = rtc.LocalAudioTrack.create_audio_track(
-                "memoria-audio", audio_source)
-            await room.local_participant.publish_track(
-                audio_track,
-                rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE))
+            # (fanned out). SKIPPED entirely when the patient's
+            # audio_capture_enabled is false (facilities audio kill,
+            # 2026-07-28): the track is never published, so clips,
+            # transcripts, and caregiver live audio are silent at the
+            # source — nothing downstream can leak what was never sent.
+            if self.audio:
+                audio_source = rtc.AudioSource(
+                    _AUDIO_RATE, _AUDIO_CH, queue_size_ms=_AUDIO_QUEUE_MS)
+                audio_track = rtc.LocalAudioTrack.create_audio_track(
+                    "memoria-audio", audio_source)
+                await room.local_participant.publish_track(
+                    audio_track,
+                    rtc.TrackPublishOptions(
+                        source=rtc.TrackSource.SOURCE_MICROPHONE))
+            else:
+                audio_source = None
+                log(f"[{self.identity}] AUDIO OFF — no audio track published "
+                    f"(patient audio_capture_enabled=false)")
         except BaseException:  # noqa: BLE001 — re-raised below
             # Anything failing after a successful room.connect (permission
             # apply, publish_track, cancellation) would otherwise leak the
@@ -349,7 +361,8 @@ class Publisher:
         self.room, self.lk_source, self.audio_source = room, source, audio_source
         self._lk_dropped = False
         self.publishing = True
-        log(f"[{self.identity}] LiveKit CONNECTED + publishing (video+audio)")
+        log(f"[{self.identity}] LiveKit CONNECTED + publishing "
+            f"({'video+audio' if self.audio else 'video ONLY, audio killed'})")
 
     async def teardown(self):
         self.publishing = False
@@ -385,17 +398,29 @@ class CameraSource:
         self.frame_us = 0
         self.frames = 0
 
-    def attach(self, identity, room_name, desired, privacy=False):
+    def attach(self, identity, room_name, desired, privacy=False, audio=True):
         """Add/refresh a publisher. Cheap + synchronous — the control loop picks up
         a newly-attached publisher on its next tick and connects it to LiveKit."""
         pub = self.publishers.get(identity)
         if pub is None:
             pub = Publisher(identity=identity, room_name=room_name, src=self,
-                            privacy=privacy)
+                            privacy=privacy, audio=audio)
             self.publishers[identity] = pub
             log(f"[{identity}] attached to {_rtsp_host(self.rtsp)} "
-                f"(desired={desired}, privacy={privacy})")
-        elif privacy != pub.privacy:
+                f"(desired={desired}, privacy={privacy}, audio={audio})")
+            return
+        if audio != pub.audio:
+            # Facilities audio kill (2026-07-28): the audio track can only
+            # be added/removed by republishing — force a reconnect either
+            # direction; connect() consults pub.audio BEFORE publishing,
+            # so an audio-off flip is fail-closed (no track, ever, until
+            # someone flips it back and we republish with it).
+            log(f"[{identity}] audio_capture_enabled -> {audio} — forcing "
+                f"republish")
+            pub.audio = audio
+            pub._lk_dropped = True
+            pub.publishing = False
+        if privacy != pub.privacy:
             # Roster flipped privacy_enabled — re-apply on the LIVE room
             # (set_track_subscription_permissions is a sync FFI call). If we
             # can't apply while turning privacy ON, fail CLOSED: force a
@@ -892,7 +917,8 @@ class RosterManager:
             # privacy_enabled is a NEW roster field (pinned contract) — parse
             # tolerantly so an older backend that omits it means "not private".
             grp["pubs"][ident] = (cam["livekit_room"], cam["desired_state"],
-                                  bool(cam.get("privacy_enabled", False)))
+                                  bool(cam.get("privacy_enabled", False)),
+                                  bool(cam.get("audio_capture_enabled", True)))
 
         # Stop sources whose physical camera has no roster cameras left at all
         # (every sharing patient deleted in the dashboard).
@@ -908,18 +934,19 @@ class RosterManager:
         for key, grp in groups.items():
             if key not in self.sources:
                 src = CameraSource(key=key, rtsp=key, mac=grp["mac"], g=self.g)
-                for ident, (room, desired, privacy) in grp["pubs"].items():
-                    src.attach(ident, room, desired, privacy)
+                for ident, (room, desired, privacy, audio) in grp["pubs"].items():
+                    src.attach(ident, room, desired, privacy, audio)
                 task = asyncio.create_task(src.run())
                 self.sources[key] = (src, task)
                 log(f"[{_rtsp_host(key)}] source started — 1 RTSP pull, "
                     f"{len(grp['pubs'])} publisher(s)")
             else:
                 src, _ = self.sources[key]
-                # attach new / refresh desired_state + privacy for wanted
-                # publishers (a privacy flip re-applies SFU permissions)
-                for ident, (room, desired, privacy) in grp["pubs"].items():
-                    src.attach(ident, room, desired, privacy)
+                # attach new / refresh desired_state + privacy + audio for
+                # wanted publishers (a privacy flip re-applies SFU
+                # permissions; an audio flip forces a republish)
+                for ident, (room, desired, privacy, audio) in grp["pubs"].items():
+                    src.attach(ident, room, desired, privacy, audio)
                 # detach publishers this physical camera no longer serves
                 for ident in list(src.publishers):
                     if ident not in grp["pubs"]:
