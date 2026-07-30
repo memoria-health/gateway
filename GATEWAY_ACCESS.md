@@ -40,11 +40,37 @@ gateway appliance. Credentials are committed on purpose (project policy).
 - **User:** `potaton00b`  **Password:** `<GATEWAY_PASSWORD-REDACTED>`  (sudo password is the same).
 - **RTSP (Tapo camera) password is also `<GATEWAY_PASSWORD-REDACTED>`** (accounts `camera1` /
   `camera2`) — coincidence, same string.
-- **No SSH key is configured.** It's password auth. This Mac has **no `sshpass`**
-  → use `expect`. If you want key-based access, copy a pubkey into the box's
-  `~/.ssh/authorized_keys` first (one-time, via the expect password flow).
 
-### expect templates (this is how you actually connect)
+### KEY AUTH (2026-07-29) — prefer this
+
+`~/.ssh/memoria_ops.pub` is installed in the box's `authorized_keys`, so
+ordinary ssh and rsync work with no expect wrapper and no password:
+
+```bash
+ssh -i ~/.ssh/memoria_ops potaton00b@memoria-gateway.local 'systemctl is-active memoria-gateway'
+rsync -az -e "ssh -i ~/.ssh/memoria_ops" publisher.py potaton00b@memoria-gateway.local:~/nemara-gateway/
+```
+
+**`sudo` still wants the password.** The one-time fix, run once on the box,
+lets the watchdog restart exactly one service and nothing else:
+
+```bash
+echo 'potaton00b ALL=(root) NOPASSWD: /usr/bin/systemctl restart memoria-gateway, /usr/bin/systemctl is-active memoria-gateway, /usr/bin/systemctl status memoria-gateway' \
+  | sudo tee /etc/sudoers.d/memoria-gateway-watchdog >/dev/null
+sudo chmod 440 /etc/sudoers.d/memoria-gateway-watchdog
+sudo visudo -c -f /etc/sudoers.d/memoria-gateway-watchdog
+```
+
+Until that exists, `tools/sentinel.py restart_gateway` reports
+`GATEWAY_RESTART_FAILED: sudo wants a password` rather than hanging. The
+sentinel has NO password path any more — this hardware sits in someone's
+home, and a shared password usable from any machine on the LAN is not an
+acceptable control for it.
+
+The password remains valid for interactive human use and is the fallback
+if the key is ever lost. Retire it once every tool is on keys.
+
+### expect templates (password fallback / a box without the key yet)
 
 **Read-only command (no sudo):**
 ```tcl

@@ -193,6 +193,10 @@ class Publisher:
         # Watchdog bookkeeping (2026-07-27): first moment this publisher
         # was observed NOT (connected + publishing); None while healthy.
         self.unhealthy_since = None
+        # First moment the BACKEND reported this camera offline while we
+        # believed we were publishing to it; None while frames land.
+        # Read by RosterManager._check_publish_freshness.
+        self.dark_since = None
         self.last_pub = 0.0
 
     def _apply_permissions_to(self, room, quiet=False):
@@ -460,35 +464,12 @@ class CameraSource:
             await pub.teardown()
             log(f"[{identity}] detached from {_rtsp_host(self.rtsp)}")
 
-    # DEAD CODE (pre-existing): never scheduled anywhere, and it reads
-    # `self.sources` (a RosterManager attribute CameraSource doesn't have) so
-    # it would crash if ever scheduled — left untouched intentionally.
-    async def _watchdog(self):
-        while True:
-            await asyncio.sleep(WD_POLL_S)
-            now = time.monotonic()
-            for src, _task in list(self.sources.values()):
-                for ident, pub in list(getattr(src, "publishers", {}).items()):
-                    if pub.desired != "connected":
-                        pub.unhealthy_since = None
-                        continue
-                    healthy = (
-                        pub.room is not None
-                        and pub.publishing
-                        and pub.room.connection_state
-                        == rtc.ConnectionState.CONN_CONNECTED
-                    )
-                    if healthy:
-                        pub.unhealthy_since = None
-                    elif pub.unhealthy_since is None:
-                        pub.unhealthy_since = now
-                    elif now - pub.unhealthy_since > WD_LK_UNHEALTHY_S:
-                        log(f"[{ident}] WATCHDOG: LiveKit unhealthy "
-                            f"{now - pub.unhealthy_since:.0f}s "
-                            f"(room={'yes' if pub.room else 'no'} "
-                            f"publishing={pub.publishing}) — exiting for "
-                            f"a clean systemd restart")
-                        os._exit(3)
+    # (The 2026-07-27 `_watchdog` that lived here was DEAD — never
+    # scheduled, and it read `self.sources`, a RosterManager attribute
+    # CameraSource does not have, so it would have crashed if it ever
+    # had been. Both of its judgments now run for real in
+    # RosterManager._check_publish_freshness, which is on a loop that
+    # actually executes.)
 
     async def run(self):
         backoff = 1
@@ -762,21 +743,28 @@ class CameraSource:
                         pub.last_pub = now
 
 
-# ── Process watchdog (2026-07-27, the wifi-glitch lesson) ────────────
+# ── Process watchdog (2026-07-27, rewired 2026-07-29) ────────────────
 # The per-camera supervisor + rejoin loop handle every failure that
 # RAISES. What they cannot see is the zombie transport: the SDK's
 # "disconnected" event never fires, publishing stays True, and
 # capture_frame swallows frames into a dead WebRTC connection — the
-# gateway ran 4d10h in exactly that state, blind and "healthy".
-# This watchdog judges OUTCOME: a publisher that wants to be connected
-# but is not verifiably (room + publishing + CONN_CONNECTED) for
-# WD_LK_UNHEALTHY_S gets the whole process killed. systemd restarts us
-# (Restart=always + StartLimitIntervalSec=0 — it must NEVER declare us
-# hopeless), and a from-scratch boot rebuilds every connection. During
-# a long outage we cycle every ~minute until the network returns, then
-# the next boot succeeds end-to-end with no human involved.
-WD_POLL_S = 5.0
+# gateway ran 4d10h in exactly that state, blind and "healthy", and
+# then did it again on the 2026-07-29 wifi blip.
+# The watchdog judges OUTCOME and kills the whole process; run.sh /
+# systemd restart us (Restart=always + StartLimitIntervalSec=0 — it
+# must NEVER declare us hopeless) and a from-scratch boot rebuilds
+# every connection with no human involved.
+# It lives in RosterManager._check_publish_freshness and runs on the
+# roster poll (poll_seconds, ~3s). The 2026-07-27 version was written
+# as a standalone loop that nothing ever started — which is precisely
+# why the second zombie survived. If you move this logic again, make
+# sure something still calls it.
 WD_LK_UNHEALTHY_S = 45.0
+# How long the backend may report a camera offline while we believe we
+# are publishing to it, before we restart. Well clear of the reconciler's
+# own debounce (10s poll + 30s liveness grace + absent-streak) so an
+# ordinary blip that both sides recover from never trips it.
+WD_PUBLISH_DARK_S = 120.0
 
 
 class RosterManager:
@@ -795,6 +783,11 @@ class RosterManager:
         self.poll_s = g["poll_seconds"]
         self.local = {c["livekit_identity"]: c for c in g.get("cameras", [])}
         self.sources = {}   # source_key (rtsp) -> (CameraSource, task)
+        # source_key -> CameraSource.frames at the previous roster poll.
+        # The watchdog compares against it to tell "we're decoding but
+        # can't get frames out" (our bug) from "we have no frames to
+        # send" (the camera's).
+        self._wd_frames = {}
         self._warned = set()
         self._fingerprint = ""
         self._lock = asyncio.Lock()
@@ -877,7 +870,106 @@ class RosterManager:
                 await asyncio.sleep(self.poll_s)
                 continue
             await self._apply(roster)
+            self._check_publish_freshness(roster)
             await asyncio.sleep(self.poll_s)
+
+    def _check_publish_freshness(self, roster):
+        """The process watchdog. Two judgments, one loop.
+
+        (A) LiveKit visibly unhealthy — we want to be connected but
+        room / publishing / connection_state say we are not. This was
+        written 2026-07-27 but lived on a method nothing ever scheduled,
+        so it has never once run; it does now.
+
+        (B) The zombie — everything here looks perfect and no media is
+        actually leaving.
+
+        The 2026-07-29 wifi blip left a publisher that had a room, had
+        publications, and reported CONN_CONNECTED — while zero media
+        actually reached the SFU. Nothing observable on this box could
+        tell the difference: `capture_frame` swallows frames into a dead
+        WebRTC transport without complaint. Only the subscriber knows,
+        so the roster now carries `online` (the backend's own view of
+        frame arrival, stamped on real frames and independent of AI
+        pause) and we act on it.
+
+        BOTH judgments are gated on this box actually DECODING frames
+        for that camera right now, and this gate is load-bearing. When a
+        camera is unplugged or off the wifi, `_run_pipeline` raises and
+        its `finally` tears every publisher down — so `room is None` and
+        `publishing is False`, which reads as "unhealthy" to (A) and
+        would kill the process every 45s for as long as the camera stays
+        unplugged, taking every OTHER camera on this box down with it on
+        each restart. A dead camera is the per-camera supervisor's job
+        (it retries with backoff); the process watchdog only has
+        standing when we have frames in hand and cannot get them out.
+
+        Restart, not repair: a from-scratch boot rebuilds every RTSP
+        pull and every LiveKit connection, which is the only thing known
+        to clear this state. run.sh / systemd bring us straight back.
+
+        Called ONLY from the roster poll — `/gateway/wait` answers with
+        a different, `online`-free payload, and treating a missing field
+        as "healthy" there would keep resetting the timer.
+        """
+        online = {c.get("livekit_identity"): c.get("online")
+                  for c in roster if c.get("livekit_identity")}
+        now = time.monotonic()
+        for gone in set(self._wd_frames) - set(self.sources):
+            self._wd_frames.pop(gone, None)   # camera deleted from the roster
+        for key, (src, _task) in list(self.sources.items()):
+            # Did our own decode advance since the previous poll? The
+            # counter is monotonic per pipeline and resets to 0 on a
+            # pipeline restart, so compare with > and treat any reset as
+            # "not pulling" for one poll — a conservative direction.
+            prev = self._wd_frames.get(key)
+            self._wd_frames[key] = src.frames
+            pulling = prev is not None and src.frames > prev
+
+            for ident, pub in list(src.publishers.items()):
+                if not pulling:
+                    pub.unhealthy_since = None
+                    pub.dark_since = None
+                    continue
+
+                # (A) visibly unhealthy
+                if pub.desired != "connected":
+                    pub.unhealthy_since = None
+                else:
+                    healthy = (
+                        pub.room is not None
+                        and pub.publishing
+                        and pub.room.connection_state
+                        == rtc.ConnectionState.CONN_CONNECTED
+                    )
+                    if healthy:
+                        pub.unhealthy_since = None
+                    elif pub.unhealthy_since is None:
+                        pub.unhealthy_since = now
+                    elif now - pub.unhealthy_since > WD_LK_UNHEALTHY_S:
+                        log(f"[{ident}] WATCHDOG: LiveKit unhealthy "
+                            f"{now - pub.unhealthy_since:.0f}s "
+                            f"(room={'yes' if pub.room else 'no'} "
+                            f"publishing={pub.publishing}) — exiting for "
+                            f"a clean restart")
+                        os._exit(3)
+
+                # (B) the zombie. `is not False` covers a backend too
+                # old to send the field: with no signal we cannot judge,
+                # so we clear the timer rather than restart on missing
+                # data.
+                if not pub.publishing or online.get(ident) is not False:
+                    pub.dark_since = None
+                    continue
+                if pub.dark_since is None:
+                    pub.dark_since = now
+                    log(f"[{ident}] backend reports NO frames arriving while "
+                        f"we believe we're publishing — watching")
+                elif now - pub.dark_since > WD_PUBLISH_DARK_S:
+                    log(f"[{ident}] WATCHDOG: publishing into the void for "
+                        f"{now - pub.dark_since:.0f}s (backend says offline) "
+                        f"— exiting for a clean restart")
+                    os._exit(4)
 
     async def _wait_loop(self):
         """Fast path: hold ONE long-poll open; the backend answers the instant a
