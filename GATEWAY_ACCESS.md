@@ -67,8 +67,40 @@ sentinel has NO password path any more — this hardware sits in someone's
 home, and a shared password usable from any machine on the LAN is not an
 acceptable control for it.
 
-The password remains valid for interactive human use and is the fallback
-if the key is ever lost. Retire it once every tool is on keys.
+### Fleet access — how a box you have never touched lets you in
+
+`deploy/ops_authorized_keys` holds the ops PUBLIC keys, and two scripts
+bake it in:
+
+* `deploy/prep-golden-image.sh` seeds it into the template, so every
+  clone ships trusting those keys from first boot;
+* `deploy/memoria-firstboot.sh` re-asserts it on the clone (self-heal,
+  and it fixes a box imaged from a template cut before the seeding
+  step existed, since the file itself ships in the repo).
+
+Both are additive and idempotent: a key an operator added by hand is
+kept, re-running never duplicates a line. Verified on Ubuntu 2026-07-30
+— fresh box, re-run, hand-added key preserved, comments never written
+as keys, output parses with `ssh-keygen -l`.
+
+Reaching a box off-LAN is then: `python3 scripts/gen-ssh-config.py`
+(reads each box's backend-assigned reverse port) → `ssh memoria-<name>`
+→ relay hop → that box's port 22 → your key.
+
+**DO NOT disable password auth yet.** Order matters, and getting it
+wrong locks you out of the whole fleet:
+
+1. cut a golden image WITH the seeding step (done — the code is here);
+2. boot one real clone and confirm `ssh -i ~/.ssh/memoria_ops` works on
+   it, with no password anywhere;
+3. confirm the relay hop works for that box (needs the ops key on the
+   relay — still pending);
+4. only then set `PasswordAuthentication no`, and roll it to already-
+   deployed boxes only after appending the key to each by hand.
+
+Until step 4, the account password is load-bearing: it is the ONLY way
+into a box whose image predates this change, including every box
+currently in the field.
 
 ### expect templates (password fallback / a box without the key yet)
 

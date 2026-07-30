@@ -60,6 +60,31 @@ fi
 #    one, then reconnects on the new port automatically (no hashing, no collisions).
 rm -f "$INSTALL_DIR/.tunnel-port"
 
+# 3b. re-assert the ops SSH keys. prep-golden-image.sh already seeded
+#     them into the template, so this is belt-and-braces: it recovers a
+#     clone whose authorized_keys was clobbered, and it fixes up a box
+#     imaged from a template cut BEFORE the keys file existed (the file
+#     ships in the repo under $INSTALL_DIR/deploy, so it is present on
+#     the clone even when the seeding step was not). Idempotent —
+#     nothing is duplicated, nothing already there is removed. Note it
+#     cannot help a box whose image predates the FILE itself; those
+#     need the key appended by hand once.
+OPSK="$INSTALL_DIR/deploy/ops_authorized_keys"
+BOX_USER="${BOX_USER:-potaton00b}"
+BOX_HOME="$(getent passwd "$BOX_USER" | cut -d: -f6)"
+if [ -f "$OPSK" ] && [ -n "$BOX_HOME" ] && [ -d "$BOX_HOME" ]; then
+  AK="$BOX_HOME/.ssh/authorized_keys"
+  install -d -m 0700 -o "$BOX_USER" -g "$BOX_USER" "$BOX_HOME/.ssh"
+  touch "$AK"
+  while IFS= read -r key; do
+    case "$key" in ''|'#'*) continue;; esac
+    grep -qxF "$key" "$AK" || printf '%s\n' "$key" >> "$AK"
+  done < "$OPSK"
+  chown "$BOX_USER":"$BOX_USER" "$AK"
+  chmod 0600 "$AK"
+  echo "ops keys asserted for $BOX_USER ($(grep -cvE '^\s*(#|$)' "$AK") authorized)"
+fi
+
 # 4. drop the template's accumulated logs
 journalctl --rotate >/dev/null 2>&1 || true
 journalctl --vacuum-time=1s >/dev/null 2>&1 || true

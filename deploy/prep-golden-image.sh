@@ -29,6 +29,45 @@ cp "$SCRIPT_DIR/memoria-firstboot.service" /etc/systemd/system/memoria-firstboot
 systemctl daemon-reload
 systemctl enable memoria-firstboot.service
 
+say "Seeding ops SSH keys (fleet access without a shared password)"
+# Without this, a box cut from this image accepts only the account
+# PASSWORD — which is why the password has been load-bearing for fleet
+# access, and why it could not simply be retired. The reverse tunnel
+# gets you TO port 22 on any box; this is what gets you THROUGH it.
+#
+# Deliberately additive and idempotent: an operator who has already
+# added a key by hand keeps it, and re-running prep never duplicates a
+# line. Passwords stay enabled here on purpose — turning them off is a
+# SEPARATE step, taken only after key access is verified on a real
+# clone, because getting it wrong bricks remote access to the fleet.
+seed_ops_keys() {
+  local user="${BOX_USER:-potaton00b}"
+  local src="$SCRIPT_DIR/ops_authorized_keys"
+  local home ak
+  home="$(getent passwd "$user" | cut -d: -f6)"
+  if [ -z "$home" ] || [ ! -d "$home" ]; then
+    echo "   ! no home for user '$user' — SKIPPED (set BOX_USER=)"; return
+  fi
+  if [ ! -f "$src" ]; then
+    echo "   ! $src missing — SKIPPED"; return
+  fi
+  ak="$home/.ssh/authorized_keys"
+  install -d -m 0700 -o "$user" -g "$user" "$home/.ssh"
+  touch "$ak"
+  local added=0
+  while IFS= read -r key; do
+    case "$key" in ''|'#'*) continue;; esac
+    if ! grep -qxF "$key" "$ak"; then
+      printf '%s\n' "$key" >> "$ak"
+      added=$((added + 1))
+    fi
+  done < "$src"
+  chown "$user":"$user" "$ak"
+  chmod 0600 "$ak"
+  echo "   $added key(s) added, $(grep -cvE '^\s*(#|$)' "$ak") now authorized for $user"
+}
+seed_ops_keys
+
 say "Installing the dynamic reverse-tunnel unit (port assigned by the backend)"
 # Replaces any hardcoded-port tunnel unit: the port now comes from .tunnel-port
 # (publisher.py writes it from the roster), so every box gets a UNIQUE off-LAN

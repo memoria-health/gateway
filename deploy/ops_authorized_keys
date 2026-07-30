@@ -1,0 +1,28 @@
+# Ops PUBLIC keys baked into every gateway box's authorized_keys.
+#
+# These are PUBLIC keys. Committing them is correct and safe — a public
+# key grants nothing on its own, and the whole point is that every box
+# cut from the golden image ships knowing who is allowed in, so no box
+# ever depends on a shared password for remote access.
+#
+# WHO READS THIS FILE
+#   deploy/prep-golden-image.sh  — seeds it into the template, so every
+#                                  clone has it from first boot
+#   deploy/memoria-firstboot.sh  — re-asserts it on the clone's first
+#                                  boot (self-heal if it was clobbered)
+# Both are idempotent: a key already present is left alone.
+#
+# HOW TO REACH A BOX (once the relay hop exists in ~/.ssh/config):
+#   python3 scripts/gen-ssh-config.py     # writes one alias per box
+#   ssh memoria-<caregiver>               # relay -> that box's port -> box
+# Authentication is by the matching PRIVATE key, e.g. ~/.ssh/memoria_ops.
+#
+# ADDING SOMEONE: append their public key with a comment naming the
+# human and the machine, then re-cut the golden image (existing boxes
+# need the key appended by hand — this file only affects new images).
+#
+# REMOVING SOMEONE is NOT enough on its own: deleting a line here stops
+# NEW boxes trusting them, but every already-deployed box keeps the key
+# until it is removed there too. Treat departures as a fleet-wide task.
+
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKvKAp7+3eF17J4VacKFtcZilijrcLO52asD5h+JmxnJ aryaman@memoria-ops
