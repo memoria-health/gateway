@@ -1,9 +1,29 @@
 # Memoria Gateway Box — Access & Operations (for an AI agent)
 
 Everything another Claude needs to reach, edit, deploy, and debug the physical
-gateway appliance. Credentials are committed on purpose (project policy).
+gateway appliance.
 
-> TL;DR: `ssh potaton00b@memoria-gateway.local` (password `<GATEWAY_PASSWORD-REDACTED>`). No SSH
+> **Credentials are NOT in this file.** Values in `<ANGLE_BRACKETS>` are
+> placeholders — substitute them at the point of use.
+>
+> This doc previously read "credentials are committed on purpose (project
+> policy)" and carried the live gateway/sudo password, the Tapo RTSP
+> password, a home Wi-Fi password, and the **production** LiveKit API key
+> and secret — in a tracked file on `origin/main`, where no `.gitignore`
+> rule can reach them. All of those were rotated after the leak was found
+> on 2026-08-03.
+>
+> A doc is not a secret store. Put real values in the password manager and
+> reference them by name here. If you find yourself pasting a live
+> credential into this file, that is the bug.
+>
+> | Placeholder | What it is |
+> |---|---|
+> | `<GATEWAY_PASSWORD>` | box login + sudo, also the Tapo RTSP password |
+> | `<WIFI_PASSWORD>` | the home Wi-Fi the box joins |
+> | `<LIVEKIT_API_KEY>` / `<LIVEKIT_API_SECRET>` | LiveKit Cloud, **production** project |
+
+> TL;DR: `ssh potaton00b@memoria-gateway.local` (password `<GATEWAY_PASSWORD>`). No SSH
 > key exists — it's **password auth**, and this Mac has **no `sshpass`**, so you
 > must drive SSH/rsync with **`expect`** (templates below). `sudo` needs a PTY
 > (`ssh -tt`). The service is `memoria-gateway` (systemd). Deploy = edit local
@@ -27,7 +47,7 @@ gateway appliance. Credentials are committed on purpose (project policy).
   the name** — the box is on DHCP so its IP moves.
 - **Current IP:** `10.0.0.51` (fallback only). **Wi-Fi MAC:** `28:0c:50:69:69:e1`
   (last resort: MAC-scan the /24).
-- **Wi-Fi:** SSID **`Suburban Living`**, password **`<WIFI_PASSWORD-REDACTED>`**.
+- **Wi-Fi:** SSID **`Suburban Living`**, password **`<WIFI_PASSWORD>`**.
   NetworkManager-managed, autoconnect on. (PSK also recoverable on-box via
   `sudo grep -r psk= /etc/NetworkManager/system-connections/`.)
 - **If unreachable:** (a) box may be **off** — check the power light (BIOS AC
@@ -37,8 +57,8 @@ gateway appliance. Credentials are committed on purpose (project policy).
 
 ## 3. SSH / credentials
 
-- **User:** `potaton00b`  **Password:** `<GATEWAY_PASSWORD-REDACTED>`  (sudo password is the same).
-- **RTSP (Tapo camera) password is also `<GATEWAY_PASSWORD-REDACTED>`** (accounts `camera1` /
+- **User:** `potaton00b`  **Password:** `<GATEWAY_PASSWORD>`  (sudo password is the same).
+- **RTSP (Tapo camera) password is also `<GATEWAY_PASSWORD>`** (accounts `camera1` /
   `camera2`) — coincidence, same string.
 
 ### KEY AUTH (2026-07-29) — prefer this
@@ -110,7 +130,7 @@ cat > /tmp/gw.exp <<'EXP'
 set timeout 40
 spawn ssh -o StrictHostKeyChecking=accept-new potaton00b@memoria-gateway.local {REMOTE_CMD_HERE}
 expect {
-  -re {[Pp]assword:} { send "<GATEWAY_PASSWORD-REDACTED>\r"; exp_continue }
+  -re {[Pp]assword:} { send "<GATEWAY_PASSWORD>\r"; exp_continue }
   -re {yes/no} { send "yes\r"; exp_continue }
   eof
 }
@@ -121,14 +141,14 @@ expect -f /tmp/gw.exp
 **Command needing sudo — MUST use `ssh -tt` (sudo needs a real TTY):**
 ```tcl
 spawn ssh -tt -o StrictHostKeyChecking=accept-new potaton00b@memoria-gateway.local {sudo systemctl restart memoria-gateway; systemctl is-active memoria-gateway}
-# answer BOTH the ssh prompt AND the "[sudo] password" prompt with <GATEWAY_PASSWORD-REDACTED>
+# answer BOTH the ssh prompt AND the "[sudo] password" prompt with <GATEWAY_PASSWORD>
 expect {
-  -re {[Pp]assword:} { send "<GATEWAY_PASSWORD-REDACTED>\r"; exp_continue }
+  -re {[Pp]assword:} { send "<GATEWAY_PASSWORD>\r"; exp_continue }
   -re {yes/no} { send "yes\r"; exp_continue }
   eof
 }
 ```
-Tip: scrub the password out of any output you print (`sed 's/<GATEWAY_PASSWORD-REDACTED>/***/g'`).
+Tip: scrub the password out of any output you print (`sed 's/<GATEWAY_PASSWORD>/***/g'`).
 
 ### Off-LAN access (when NOT on the box's Wi-Fi) — via the DO relay
 
@@ -138,7 +158,7 @@ else, reach the box through the reverse-SSH relay — DigitalOcean droplet
 `~/.ssh/config` already has the hops wired:
 
 ```bash
-ssh memoria-box-01   # → ProxyJump memoria-relay → localhost:22001 → OptiPlex (password <GATEWAY_PASSWORD-REDACTED>)
+ssh memoria-box-01   # → ProxyJump memoria-relay → localhost:22001 → OptiPlex (password <GATEWAY_PASSWORD>)
 ```
 Verified working off-network 2026-07-09.
 
@@ -213,8 +233,8 @@ then `stream 1920x1080@15 — pipeline up`.
 ```jsonc
 {
   "livekit_url":        "wss://nemara-pdx0uelu.livekit.cloud",   // shared dev+prod project
-  "livekit_api_key":    "<LIVEKIT_API_KEY-REDACTED>",
-  "livekit_api_secret": "<LIVEKIT_API_SECRET-REDACTED>",
+  "livekit_api_key":    "<LIVEKIT_API_KEY>",
+  "livekit_api_secret": "<LIVEKIT_API_SECRET>",
   "backend_url":        "https://nemara-backend-production.up.railway.app",  // PROD (Railway)
   "poll_seconds": 1,
   "gateway_token":      "gw-prod-token-2026-B1VGBaerS8wuTULm",    // maps to a prod gateways row
@@ -222,8 +242,8 @@ then `stream 1920x1080@15 — pipeline up`.
 }
 ```
 - **Fan-out:** the 6 `cameras` entries are only **2 physical Tapos**:
-  - `10.0.0.145` (RTSP `camera1:<GATEWAY_PASSWORD-REDACTED>`) → `cam_53ba55c9`, `cam_619d9526`, `cam_5089d97a`
-  - `10.0.0.223` (RTSP `camera2:<GATEWAY_PASSWORD-REDACTED>`) → `cam_c4218fa0`, `cam_fcaadb06`, `cam_260225e7`
+  - `10.0.0.145` (RTSP `camera1:<GATEWAY_PASSWORD>`) → `cam_53ba55c9`, `cam_619d9526`, `cam_5089d97a`
+  - `10.0.0.223` (RTSP `camera2:<GATEWAY_PASSWORD>`) → `cam_c4218fa0`, `cam_fcaadb06`, `cam_260225e7`
   A camera runs only if it's in BOTH this local map AND the backend roster
   (`GET /v1/gateway/roster`, authed with `gateway_token`), which is the source of
   truth for which cameras run + their `desired_state`.
@@ -247,11 +267,11 @@ then `stream 1920x1080@15 — pipeline up`.
   into the memoria-setup unit — §12), so it creates/updates *this* box's gateways
   row, then appends `{livekit_identity, rtsp, mac}` to `cameras.json`; the
   publisher picks it up next poll (no restart).
-- **Camera creds:** the portal probes/pulls RTSP with **`camera1` / `<GATEWAY_PASSWORD-REDACTED>`**
+- **Camera creds:** the portal probes/pulls RTSP with **`camera1` / `<GATEWAY_PASSWORD>`**
   by default. A camera shows in the scan regardless (discovery is credential-free)
   but the **thumbnail** needs matching creds — if a Tapo's Camera Account differs,
   edit the per-camera `user`/`pass` fields + hit **↻**, or set the Tapo's Camera
-  Account to `camera1`/`<GATEWAY_PASSWORD-REDACTED>`. New Tapo prep: join it to Wi-Fi via the Tapo
+  Account to `camera1`/`<GATEWAY_PASSWORD>`. New Tapo prep: join it to Wi-Fi via the Tapo
   app first (C100 is 2.4 GHz only), then set its Camera Account.
 
 ## 8. How it works (architecture, brief)
@@ -364,7 +384,7 @@ anywhere; Wi-Fi only):**
 1. Flash the workbench box from any working image (IMAGE-A) — gives it a working
    OS + code base.
 2. Bring it online at the console over Wi-Fi: `ip link` → find the Wi-Fi iface →
-   `nmcli device wifi connect "Suburban Living" password "<WIFI_PASSWORD-REDACTED>"` →
+   `nmcli device wifi connect "Suburban Living" password "<WIFI_PASSWORD>"` →
    `git pull` the repo (this is why the code lives on GitHub: so the box can pull it).
 3. `sudo bash deploy/prep-golden-image.sh` — installs `memoria-firstboot`, deletes
    saved Wi-Fi, blanks identity, arms the run-once flag.
@@ -453,7 +473,7 @@ Verified 2026-07-10 (`gw jane@patel.co` → port 22001 → box).
 - **Add a teammate (e.g. cofounder):** they generate an SSH key → add their public
   key to the relay → give them the registry token + the `gw` script. Done — `gw
   <account>` works for them too, from their own machine.
-- **Today** the box hop still uses the password (`<GATEWAY_PASSWORD-REDACTED>`). Installing the fleet
+- **Today** the box hop still uses the password (`<GATEWAY_PASSWORD>`). Installing the fleet
   key on boxes (automatic in the template; a one-time append on the OptiPlex) makes
   `gw` fully passwordless. The OptiPlex is intentionally left on password until you
   choose to upgrade it.
