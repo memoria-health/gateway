@@ -16,3 +16,5 @@ cameras.*.json.bak
 /wifi-connect/
 portal-cert.pem
 portal-key.pem
+.env.*
+!.env.example
