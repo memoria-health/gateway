@@ -223,6 +223,32 @@ class Publisher:
             room.local_participant.set_track_subscription_permissions(
                 allow_all_participants=True)
 
+    def _mint_token(self):
+        """POST /v1/livekit/token with the gateway site token.
+
+        The backend checks that this box owns the camera named by
+        `identity` and that `room` is that camera's own room, then returns a
+        JWT scoped to exactly that. A 401 here means the box is asking for a
+        camera it does not own (or its site token is stale) — both are real
+        errors and must surface, not be worked around.
+        """
+        body = json.dumps({
+            "room": self.room_name,
+            "identity": self.identity,
+            "role": "gateway",
+        }).encode()
+        req = urllib.request.Request(
+            f"{self.src.backend_url}/v1/livekit/token",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.src.gateway_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode())["token"]
+
     def apply_permissions(self, quiet=False):
         """Re-apply permissions to the live room (privacy flag flipped by the
         roster, or a detector worker joined). No-op while disconnected — the
@@ -231,10 +257,13 @@ class Publisher:
             self._apply_permissions_to(self.room, quiet=quiet)
 
     async def connect(self):
-        token = (api.AccessToken(self.src.api_key, self.src.api_secret)
-                 .with_identity(self.identity).with_name(self.identity)
-                 .with_grants(api.VideoGrants(room_join=True, room=self.room_name))
-                 .to_jwt())
+        # Ask the backend to mint the token (2026-08-03). Blocking urllib in a
+        # thread, matching the roster poller's style — one short call per
+        # (re)connect, not a hot path. Any failure propagates so the existing
+        # reconnect-with-backoff treats it like any other connect failure; the
+        # box must NOT fall back to signing its own, because it no longer has
+        # a secret to sign with.
+        token = await asyncio.to_thread(self._mint_token)
         room = rtc.Room()
 
         def _on_disconnected(*_a):
@@ -392,8 +421,16 @@ class CameraSource:
         self.rtsp = rtsp            # mutated in place by MAC re-discovery
         self.mac = mac
         self.lk_url = g["livekit_url"]
-        self.api_key = g["livekit_api_key"]
-        self.api_secret = g["livekit_api_secret"]
+        # LiveKit tokens are MINTED BY THE BACKEND (2026-08-03), so the box
+        # never holds the LiveKit API secret. It previously read
+        # `livekit_api_key`/`livekit_api_secret` from cameras.json and signed
+        # its own tokens — that is how the PRODUCTION LiveKit credential came
+        # to sit in three places at once (this box, a committed ops doc, and a
+        # leaked .env), which in turn made rotating it a fleet-wide operation
+        # nobody wanted to run. The site token below is the same one the
+        # roster poll already uses.
+        self.backend_url = g["backend_url"].rstrip("/")
+        self.gateway_token = g["gateway_token"]
         self.logo = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "memoria.png")
         self.publishers = {}        # identity -> Publisher
