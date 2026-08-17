@@ -477,3 +477,73 @@ Verified 2026-07-10 (`gw jane@patel.co` → port 22001 → box).
   key on boxes (automatic in the template; a one-time append on the OptiPlex) makes
   `gw` fully passwordless. The OptiPlex is intentionally left on password until you
   choose to upgrade it.
+
+---
+
+## Credential provisioning on the box (2026-08-03)
+
+Nothing secret lives in this repo or in `cameras.json` any more. The box gets
+its credentials from one file, written at provisioning time:
+
+```bash
+sudo install -m 600 -o potaton00b -g potaton00b /dev/null /opt/memoria-gateway/.env
+sudo -u potaton00b tee /opt/memoria-gateway/.env >/dev/null <<'EOF'
+GATEWAY_TOKEN=<the box's site token>
+TAPO_PASSWORD=<camera RTSP password>
+EOF
+```
+
+`chmod 600`, owned by the service user, and **never** committed — the repo's
+`.gitignore` covers `.env` and `.env.*`.
+
+What is deliberately NOT in that file:
+
+| Not present | Why |
+|---|---|
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | The box no longer signs its own tokens. `Publisher._mint_token` asks the backend (`POST /v1/livekit/token`, `role="gateway"`) using `GATEWAY_TOKEN`. The LiveKit secret exists only in the backend's environment, so rotating it is one change instead of a fleet update. |
+| Wi-Fi password | Held by NetworkManager's own connection store on the box, not by us. |
+
+**Reading them in code:** no fallbacks. `setup_server.py` used to do
+`q.get("pass") or ["qwerty123"]`, and that default is exactly how the camera
+password entered the source tree and reached `origin/main`. A missing
+credential must raise, not quietly work.
+
+## SSH: cutting over to key-only auth
+
+`1c8421a` bakes the ops key into every box, so half of this is done. The
+remaining steps need the box **online** — run them in this order, because
+getting it wrong locks you out of hardware sitting in someone's home:
+
+1. Confirm key auth works: `ssh -o PasswordAuthentication=no memoria-box-01 true`
+   must succeed. **Do not proceed until it does.**
+2. Confirm passwordless sudo for the service commands the runbook uses.
+3. Only then: `PasswordAuthentication no` in `sshd_config`, `sudo systemctl
+   reload ssh`.
+4. Keep a second session open while doing step 3, so a mistake is recoverable.
+
+Until step 3 lands, the account password stays load-bearing — which is why it
+was rotated rather than simply removed from this doc.
+
+## VERIFY WHEN THE BOX COMES BACK ONLINE
+
+Written and unit-checked with the hardware offline, so none of this is
+confirmed against a real box. Verify in this order:
+
+- [ ] **Backend token minting.** Box publishes at all — `Publisher._mint_token`
+      gets a 200 and the camera appears as `cam_*` in the room. A 401 means the
+      camera's `gateway_id` does not match the box's site token.
+- [ ] **Unowned cameras.** Any camera with `gateway_id IS NULL` will now FAIL to
+      publish (it still shows on the roster). That is intentional, but if the
+      fleet has un-backfilled rows they need a `gateway_id` set first.
+- [ ] **Reconnect path.** Kill the backend briefly: the publisher should retry
+      with its existing backoff, not crash and not fall back to self-signing.
+- [ ] **Setup server.** Provision a camera through the web form — the password
+      field is no longer pre-filled, and submitting it blank must 400 rather
+      than silently using a default.
+- [ ] **Trueview cameras.** Their password is legitimately empty; confirm an
+      explicit empty `pass=` still works (absent vs empty are different).
+- [ ] **Rotated credentials.** The box's `.env` carries the NEW `GATEWAY_TOKEN`
+      and `TAPO_PASSWORD`, and Wi-Fi reconnects on the new password.
+- [ ] Integration tests `test/integration/test_livekit_token_gateway.py` in
+      nemara-backend — they could not run locally (the whole integration suite
+      fails to reach its fixtures in this environment).

@@ -94,10 +94,15 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <script>
 // Per-brand RTSP defaults. The stream PATH is model-specific (Tapo serves
 // /stream1; Trueview serves /ch0_0.264) — picking a model pre-fills path +
-// default credentials, and every field stays editable ("Custom") so a new
-// brand never needs a code change to get a box installed.
+// username, and every field stays editable ("Custom") so a new brand never
+// needs a code change to get a box installed.
+//
+// PASSWORDS ARE NEVER PRE-FILLED (2026-08-03). The Tapo entry used to carry
+// the real camera password, which is how it ended up committed and then
+// published on origin/main. The installer types it; a blank field that
+// fails is the correct outcome, a working default is not.
 const PROFILES = {
-  tapo:     {title:'Tapo',     path:'/stream1',   user:'camera1', pass:'<GATEWAY_PASSWORD-REDACTED>'},
+  tapo:     {title:'Tapo',     path:'/stream1',   user:'camera1', pass:''},
   trueview: {title:'Trueview', path:'/ch0_0.264', user:'admin',   pass:''},
 };
 const DEFAULT_PROFILE = 'tapo';
@@ -311,8 +316,22 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(parsed.query, keep_blank_values=True)
             ip = (q.get("ip") or [""])[0]
             user = (q.get("user") or ["camera1"])[0]
-            pw = (q.get("pass") or ["<GATEWAY_PASSWORD-REDACTED>"])[0]
             path = (q.get("path") or ["/stream1"])[0]
+            # No password default (2026-08-03). This used to fall back to the
+            # real Tapo password, which is how that secret entered the source
+            # and reached origin/main. A missing credential must FAIL, not
+            # quietly succeed with a known one.
+            #
+            # Absent is not the same as empty: `keep_blank_values` above keeps
+            # Trueview's legitimately-empty password as [""], which stays
+            # valid. Only a wholly missing `pass` key is rejected.
+            if "pass" not in q:
+                self._send(400, {
+                    "error": "missing 'pass' — supply the camera password "
+                             "explicitly; there is no default",
+                })
+                return
+            pw = q["pass"][0]
             try:
                 self._send(200, grab_snapshot(ip, user, pw, path), "image/jpeg")
             except Exception as e:  # noqa: BLE001
