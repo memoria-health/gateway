@@ -341,6 +341,27 @@ class Publisher:
             # fewer beats many-mush for detection). Trade-off to decide
             # before flipping: every subscriber (caregiver app on cellular
             # included) then receives the full stream — no small rung.
+            #
+            # DECIDED 2026-08-24: the ladder is back ON (box-01's flag
+            # renamed to `.simulcast-off.disabled-20260824`; one `mv`
+            # restores it). The flapping this switch existed to stop is
+            # the SFU CHOOSING a rung, and both AI subscribers now pin
+            # their own with `set_video_quality` — the backend in
+            # `room_worker._request_layer`, the identity service in
+            # `identity/service.py:request_layer`. A pinned subscriber
+            # cannot be downshifted, so the ladder costs detection
+            # nothing and buys two things: an idle camera drops to
+            # 640x360 (LiveKit bills the subscription whether or not
+            # anything looks at the frames, and an empty room was
+            # sending 4 Mbps to two subscribers all night), and the
+            # caregiver app finally has a small rung on cellular.
+            #
+            # ORDER MATTERS. Do not remove the flag on a box whose
+            # subscribers do not pin — that is the original bug. Before
+            # 05:51 today both pinning calls failed with "requires a
+            # simulcasted publication", which is what this flag causes.
+            # Cost on the box: the encoder now makes three rungs
+            # instead of one. Watch CPU on a multi-camera box.
             # Explicit top-layer encoding (Sunny's benchmark finding,
             # 2026-07-27): the bare defaults cap the top simulcast layer at
             # 720p even from a 1080p Tapo source — prod analysis was
